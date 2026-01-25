@@ -96,7 +96,7 @@ impl Generator {
         Err(format!("Error near line {}: {}", self.line, msg))
     }
 
-    fn new(ops: Box<dyn LanguageOps>, populate_search_fields: bool) -> Self {
+    pub(crate) fn new(ops: Box<dyn LanguageOps>, populate_search_fields: bool) -> Self {
         Generator {
             line: 0,
             ops,

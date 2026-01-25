@@ -23,7 +23,7 @@ pub enum BuiltinMacro {
     This, // The current word.
 }
 
-type Nodes = Vec<Node>;
+pub type Nodes = Vec<Node>;
 
 /// A node that represents formatting or text.
 #[derive(Serialize, Debug)]
@@ -142,4 +142,15 @@ pub trait LanguageOps {
     fn to_ipa(&self, _word: &str) -> Result<Option<String>> {
         Ok(None)
     }
+}
+
+/// Parse a string as a dictionary file and return the JSON string.
+pub fn parse_and_generate(
+    ops: Box<dyn LanguageOps>,
+    input: &str,
+    populate_search_fields: bool,
+) -> Result<String> {
+    let mut g = generator::Generator::new(ops, populate_search_fields);
+    g.parse(input)?;
+    Ok(g.json())
 }
