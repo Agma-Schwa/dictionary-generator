@@ -216,6 +216,7 @@ impl Generator {
             let (words, target) = line.split_once('>').unwrap();
             let target = self.parse_tex(target)?;
             for word in words.split(',') {
+                if word.trim().is_empty() { continue }
                 let nfkd = self.normalise_for_sort(word);
                 let word = self.parse_tex(word)?;
 
@@ -1273,6 +1274,22 @@ mod test {
                 ]
             }
 
+        "#);
+
+        check!("a , > b", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "ref": {
+                            "text": "b"
+                        },
+                        "search": "a"
+                    }
+                ]
+            }
         "#);
     }
 
