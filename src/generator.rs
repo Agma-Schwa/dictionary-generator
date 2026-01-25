@@ -216,7 +216,8 @@ impl Generator {
             let (words, target) = line.split_once('>').unwrap();
             let target = self.parse_tex(target)?;
             for word in words.split(',') {
-                if word.trim().is_empty() { continue }
+                let word = word.trim();
+                if word.is_empty() { continue }
                 let nfkd = self.normalise_for_sort(word);
                 let word = self.parse_tex(word)?;
 
@@ -248,7 +249,7 @@ impl Generator {
         for part in line.split('|') {
             if word.is_none() {
                 self.disallow_specials(part, "the lemma")?;
-                word = Some(part);
+                word = Some(part.trim());
             } else {
                 parts.push(Cow::Borrowed(part.trim()));
             }
@@ -967,6 +968,15 @@ mod test {
                 "entries": [
                     {
                         "word": {
+                            "text": "a"
+                        },
+                        "ref": {
+                            "text": "e"
+                        },
+                        "search": "a"
+                    },
+                    {
+                        "word": {
                             "text": "b"
                         },
                         "ref": {
@@ -982,15 +992,6 @@ mod test {
                             "text": "e"
                         },
                         "search": "c"
-                    },
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "ref": {
-                            "text": "e"
-                        },
-                        "search": "a"
                     },
                     {
                         "word": {
@@ -1291,6 +1292,92 @@ mod test {
                 ]
             }
         "#);
+
+        check!("ad’hór|v. tr. or n.|adore|love\nvy’í, aúsó > eḍ", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "ad’hór"
+                        },
+                        "pos": {
+                            "text": "v. tr. or n."
+                        },
+                        "etym": {
+                            "text": "adore"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "text": "love."
+                            }
+                        },
+                        "hw_search": "adhor",
+                        "def_search": "love"
+                    },
+                    {
+                        "word": {
+                            "text": "aúsó"
+                        },
+                        "ref": {
+                            "text": "eḍ"
+                        },
+                        "search": "auso"
+                    },
+                    {
+                        "word": {
+                            "text": "vy’í"
+                        },
+                        "ref": {
+                            "text": "eḍ"
+                        },
+                        "search": "vyi"
+                    }
+                ]
+            }
+        "#);
+
+        check!(" b|x|x|x\na|y|y|y", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "pos": {
+                            "text": "y"
+                        },
+                        "etym": {
+                            "text": "y"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "text": "y."
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": "y"
+                    },
+                    {
+                        "word": {
+                            "text": "b"
+                        },
+                        "pos": {
+                            "text": "x"
+                        },
+                        "etym": {
+                            "text": "x"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "text": "x."
+                            }
+                        },
+                        "hw_search": "b",
+                        "def_search": "x"
+                    }
+                ]
+            }
+        "#)
     }
 
     #[test]
