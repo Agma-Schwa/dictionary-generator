@@ -25,7 +25,7 @@ struct Entry {
 #[serde(untagged)]
 enum EntryData {
     RefEntry {
-        refs: Vec<Node>,
+        r#ref: Node,
         #[serde(skip_serializing_if = "Option::is_none")] search: Option<String>,
     },
     FullEntry {
@@ -213,27 +213,26 @@ impl Generator {
             self.disallow_specials(line, "a reference entry")?;
 
             // Split the line into lemma and references and parse the lemma.
-            let (word, target_str) = line.split_once('>').unwrap();
-            let nfkd = self.normalise_for_sort(word);
-            let word = self.parse_tex(word)?;
+            let (words, target) = line.split_once('>').unwrap();
+            let target = self.parse_tex(target)?;
+            for word in words.split(',') {
+                let nfkd = self.normalise_for_sort(word);
+                let word = self.parse_tex(word)?;
 
-            // Split the references.
-            let mut refs = Vec::new();
-            for entry in target_str.split(',') { refs.push(self.parse_tex(entry)?); }
+                // Compute search string if requested.
+                let mut search = None;
+                let plain_word = word.render_plain_text(true);
+                if self.populate_search_fields {
+                    search = Some(self.normalise_for_search(&plain_word));
+                }
 
-            // Compute search string if requested.
-            let mut search = None;
-            let plain_word = word.render_plain_text(true);
-            if self.populate_search_fields {
-                search = Some(self.normalise_for_search(&plain_word));
+                self.entries.push(Entry {
+                    word,
+                    word_for_sorting: plain_word,
+                    nfkd,
+                    data: RefEntry { r#ref: target.clone(), search }
+                });
             }
-
-            self.entries.push(Entry {
-                word,
-                word_for_sorting: plain_word,
-                nfkd,
-                data: RefEntry { refs, search }
-            });
 
             return Ok(())
         }
@@ -954,31 +953,52 @@ mod test {
             {
                 "entries": [
                     {
-                        "word": {
-                            "text": "a"
-                        },
-                        "refs": [
-                            { "text": "b" }
-                        ],
+                        "word": { "text": "a" },
+                        "ref": { "text": "b" },
                         "search": "a"
                     }
                 ]
             }
         "#);
 
-        check!("a > b, cd , ef  ", r#"
+        check!("a, c ,d ,  b > e", r#"
             {
                 "entries": [
                     {
                         "word": {
+                            "text": "b"
+                        },
+                        "ref": {
+                            "text": "e"
+                        },
+                        "search": "b"
+                    },
+                    {
+                        "word": {
+                            "text": "c"
+                        },
+                        "ref": {
+                            "text": "e"
+                        },
+                        "search": "c"
+                    },
+                    {
+                        "word": {
                             "text": "a"
                         },
-                        "refs": [
-                            { "text": "b" },
-                            { "text": "cd" },
-                            { "text": "ef" }
-                        ],
+                        "ref": {
+                            "text": "e"
+                        },
                         "search": "a"
+                    },
+                    {
+                        "word": {
+                            "text": "d"
+                        },
+                        "ref": {
+                            "text": "e"
+                        },
+                        "search": "d"
                     }
                 ]
             }
@@ -991,35 +1011,33 @@ mod test {
                         "word": {
                             "text": "ac’hes"
                         },
-                        "refs": [
-                            {
-                                "group": [
-                                    {
-                                        "macro": {
-                                            "name": "lemma",
-                                            "args": [
-                                                {
-                                                    "text": "a"
-                                                }
-                                            ]
-                                        }
-                                    },
-                                    {
-                                        "text": " + "
-                                    },
-                                    {
-                                        "macro": {
-                                            "name": "lemma",
-                                            "args": [
-                                                {
-                                                    "text": "c’hes"
-                                                }
-                                            ]
-                                        }
+                        "ref": {
+                            "group": [
+                                {
+                                    "macro": {
+                                        "name": "lemma",
+                                        "args": [
+                                            {
+                                                "text": "a"
+                                            }
+                                        ]
                                     }
-                                ]
-                            }
-                        ],
+                                },
+                                {
+                                    "text": " + "
+                                },
+                                {
+                                    "macro": {
+                                        "name": "lemma",
+                                        "args": [
+                                            {
+                                                "text": "c’hes"
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        },
                         "search": "aches"
                     }
                 ]
@@ -1211,11 +1229,9 @@ mod test {
                         "word": {
                             "text": "X"
                         },
-                        "refs": [
-                            {
-                                "text": "Y"
-                            }
-                        ],
+                        "ref": {
+                            "text": "Y"
+                        },
                         "search": "x"
                     },
                     {

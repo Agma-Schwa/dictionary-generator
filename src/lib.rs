@@ -26,7 +26,7 @@ pub enum BuiltinMacro {
 pub type Nodes = Vec<Node>;
 
 /// A node that represents formatting or text.
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum Node {
     Text(String),
