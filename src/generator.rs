@@ -151,7 +151,13 @@ impl Generator {
 
         let j = Json { entries: &self.entries };
         if !pretty { serde_json::to_string(&j).unwrap() }
-        else { serde_json::to_string_pretty(&j).unwrap() }
+        else {
+            let mut buf = Vec::new();
+            let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+            j.serialize(&mut ser).unwrap();
+            String::from_utf8(buf).unwrap()
+        }
     }
 
     pub fn parse(&mut self, input: &str) -> Result<()> {
