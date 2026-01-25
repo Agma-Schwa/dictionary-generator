@@ -4,7 +4,7 @@ use serde::Serialize;
 mod generator;
 mod string_utils;
 
-type Result<T> = std::result::Result<T, String>;
+pub type Result<T> = std::result::Result<T, String>;
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
