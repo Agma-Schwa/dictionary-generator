@@ -150,7 +150,7 @@ impl Generator {
         ));
 
         let j = Json { entries: &self.entries };
-        if pretty { serde_json::to_string(&j).unwrap() }
+        if !pretty { serde_json::to_string(&j).unwrap() }
         else { serde_json::to_string_pretty(&j).unwrap() }
     }
 
