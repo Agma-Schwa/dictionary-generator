@@ -149,8 +149,9 @@ pub fn parse_and_generate(
     ops: Box<dyn LanguageOps>,
     input: &str,
     populate_search_fields: bool,
+    pretty: bool,
 ) -> Result<String> {
     let mut g = generator::Generator::new(ops, populate_search_fields);
     g.parse(input)?;
-    Ok(g.json())
+    Ok(g.json(pretty))
 }

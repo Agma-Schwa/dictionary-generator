@@ -136,7 +136,7 @@ impl Generator {
         text.to_lowercase()
     }
 
-    pub fn json(&mut self) -> String {
+    pub fn json(&mut self, pretty: bool) -> String {
         #[derive(Serialize)]
         struct Json<'a> {
             entries: &'a [Entry],
@@ -150,7 +150,8 @@ impl Generator {
         ));
 
         let j = Json { entries: &self.entries };
-        serde_json::to_string(&j).unwrap()
+        if pretty { serde_json::to_string(&j).unwrap() }
+        else { serde_json::to_string_pretty(&j).unwrap() }
     }
 
     pub fn parse(&mut self, input: &str) -> Result<()> {
@@ -691,7 +692,7 @@ mod test {
                     // in a way that is actually legible while still comparing the json without
                     // having to care about whitespace.
                     assert_eq!(
-                        json::parse(&g.json()).unwrap().to_string(),
+                        json::parse(&g.json(false)).unwrap().to_string(),
                         json::parse($out).unwrap().to_string(),
                     );
                 }
