@@ -38,6 +38,18 @@ pub enum Node {
     },
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Options {
+    /// Whether to populate search fields in the JSON output.
+    pub populate_search_fields: bool,
+
+    /// Whether to always include IPA, even if the user didn’t provide any.
+    pub always_include_ipa: bool,
+
+    /// Pretty-print JSON.
+    pub pretty_json: bool,
+}
+
 impl Node {
     pub fn builtin(m: BuiltinMacro) -> Node {
         Node::Macro { name: m, args: vec![] }
@@ -148,10 +160,9 @@ pub trait LanguageOps {
 pub fn parse_and_generate(
     ops: Box<dyn LanguageOps>,
     input: &str,
-    populate_search_fields: bool,
-    pretty: bool,
+    opts: Options,
 ) -> Result<String> {
-    let mut g = generator::Generator::new(ops, populate_search_fields);
+    let mut g = generator::Generator::new(ops, opts);
     g.parse(input)?;
-    Ok(g.json(pretty))
+    Ok(g.json())
 }

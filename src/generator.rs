@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use unicode_categories::UnicodeCategories;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::{Node, Nodes, BuiltinMacro, string_utils::*};
+use crate::{Node, Nodes, BuiltinMacro, string_utils::*, Options};
 
 use crate::{LanguageOps, Part, Result};
 
@@ -75,7 +75,7 @@ pub struct Generator {
     line: u32, // The current line.
     ops: Box<dyn LanguageOps>,
     entries: Vec<Entry>,
-    populate_search_fields: bool,
+    opts: Options,
 }
 
 impl Generator {
@@ -96,12 +96,12 @@ impl Generator {
         Err(format!("Error near line {}: {}", self.line, msg))
     }
 
-    pub(crate) fn new(ops: Box<dyn LanguageOps>, populate_search_fields: bool) -> Self {
+    pub(crate) fn new(ops: Box<dyn LanguageOps>, opts: Options) -> Self {
         Generator {
             line: 0,
             ops,
             entries: vec![],
-            populate_search_fields
+            opts
         }
     }
 
@@ -136,7 +136,7 @@ impl Generator {
         text.to_lowercase()
     }
 
-    pub fn json(&mut self, pretty: bool) -> String {
+    pub fn json(&mut self) -> String {
         #[derive(Serialize)]
         struct Json<'a> {
             entries: &'a [Entry],
@@ -150,7 +150,7 @@ impl Generator {
         ));
 
         let j = Json { entries: &self.entries };
-        if !pretty { serde_json::to_string(&j).unwrap() }
+        if !self.opts.pretty_json { serde_json::to_string(&j).unwrap() }
         else {
             let mut buf = Vec::new();
             let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
@@ -224,7 +224,7 @@ impl Generator {
                 // Compute search string if requested.
                 let mut search = None;
                 let plain_word = word.render_plain_text(true);
-                if self.populate_search_fields {
+                if self.opts.populate_search_fields {
                     search = Some(self.normalise_for_search(&plain_word));
                 }
 
@@ -305,7 +305,7 @@ impl Generator {
         // If requested, also add search keys.
         let mut def_search = None;
         let mut hw_search = None;
-        if self.populate_search_fields {
+        if self.opts.populate_search_fields {
             let mut def_search_str = match primary_definition {
                 Some(ref sense) => sense.def.render_plain_text(true),
                 None => String::new(),
@@ -318,6 +318,11 @@ impl Generator {
 
             def_search = Some(self.normalise_for_search(&def_search_str));
             hw_search = Some(self.normalise_for_search(&plain_word));
+        }
+
+        // If requested, generate IPA.
+        if ipa.is_none() && self.opts.always_include_ipa {
+            ipa = self.ops.to_ipa(&plain_word)?.map(|t|Node::text(t));
         }
 
         self.entries.push(Entry {
@@ -588,7 +593,7 @@ mod test {
     #[test]
     fn test_tex_parser() {
         let t = Box::new(TestOps {});
-        let g = Generator::new(t, false);
+        let g = Generator::new(t, Default::default());
 
         macro_rules! check {
             ($in:literal, $out:literal) => {
@@ -679,11 +684,25 @@ mod test {
     #[test]
     fn test_macro_handler() {
         let t = Box::new(TestOpsWithMacroHandler {});
-        let g = Generator::new(t, false);
+        let g = Generator::new(t, Default::default());
 
         // Unknown macros are passed to the lang ops.
         assert_eq!(g.parse_tex("\\/").unwrap().render(), "{\"text\":\"Found /!\"}");
         assert_eq!(g.parse_tex("\\foo").unwrap().render(), "{\"text\":\"BAR\"}");
+    }
+
+    macro_rules! check_with_generator {
+        ($g:expr, $in: literal, $out: literal) => {
+            $g.parse($in).unwrap();
+
+            // Use json::parse() on both sides so we can format the expected JSON output
+            // in a way that is actually legible while still comparing the json without
+            // having to care about whitespace.
+            assert_eq!(
+                json::parse(&$g.json()).unwrap().to_string(),
+                json::parse($out).unwrap().to_string(),
+            );
+        };
     }
 
     #[test]
@@ -692,16 +711,8 @@ mod test {
             ($in:literal, $out:literal) => {
                 {
                     let t = Box::new(TestOps {});
-                    let mut g = Generator::new(t, true);
-                    g.parse($in).unwrap();
-
-                    // Use json::parse() on both sides so we can format the expected JSON output
-                    // in a way that is actually legible while still comparing the json without
-                    // having to care about whitespace.
-                    assert_eq!(
-                        json::parse(&g.json(false)).unwrap().to_string(),
-                        json::parse($out).unwrap().to_string(),
-                    );
+                    let mut g = Generator::new(t, Options { populate_search_fields: true, ..Default::default() });
+                    check_with_generator!(g, $in, $out);
                 }
             };
         }
@@ -1383,7 +1394,7 @@ mod test {
     #[test]
     fn test_entry_parser_errors() {
         let t = Box::new(TestOps {});
-        let mut g = Generator::new(t, true);
+        let mut g = Generator::new(t, Default::default());
 
         macro_rules! check_err {
             ($in:literal, $out:literal) => {
@@ -1460,5 +1471,41 @@ mod test {
             "a > \\\\",
             "Error near line 1: '\\\\' cannot be used in a reference entry"
         );
+    }
+
+    #[test]
+    fn test_always_generate_ipa() {
+        struct IPAOps;
+        impl LanguageOps for IPAOps {
+            fn to_ipa(&self, w: &str) -> Result<Option<String>> {
+                Ok(Some(format!("/{w}:{w}/")))
+            }
+        }
+
+        let t = Box::new(IPAOps {});
+        let mut g = Generator::new(t, Options { always_include_ipa: true, ..Default::default() });
+        check_with_generator!(g, "a|b|c|d", r#" {
+            "entries": [
+                {
+                    "word": {
+                        "text": "a"
+                    },
+                    "pos": {
+                        "text": "b"
+                    },
+                    "etym": {
+                        "text": "c"
+                    },
+                    "ipa": {
+                        "text": "/a:a/"
+                    },
+                    "primary_definition": {
+                        "def": {
+                            "text": "d."
+                        }
+                    }
+                }
+            ]
+        }"#);
     }
 }
