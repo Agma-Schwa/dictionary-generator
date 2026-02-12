@@ -462,8 +462,8 @@ impl Generator {
         match macro_name {
             "s" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::SmallCaps),
             "w" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Lemma),
-            "textit" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Italic),
-            "textbf" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Bold),
+            "textit" | "i" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Italic),
+            "textbf" | "b" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Bold),
             "textnf" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Normal),
             "senseref" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Sense),
             "Sup" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Superscript),
