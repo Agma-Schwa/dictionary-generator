@@ -151,7 +151,7 @@ pub trait LanguageOps {
     }
 
     /// Convert a language’s text to IPA.
-    fn to_ipa(&self, _word: &str) -> Result<Option<String>> {
+    fn to_ipa(&self, _word: &str) -> Result<Option<Node>> {
         Ok(None)
     }
 }

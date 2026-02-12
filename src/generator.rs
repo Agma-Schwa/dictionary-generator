@@ -322,7 +322,7 @@ impl Generator {
 
         // If requested, generate IPA.
         if ipa.is_none() && self.opts.always_include_ipa {
-            ipa = self.ops.to_ipa(&plain_word)?.map(|t|Node::text(t));
+            ipa = self.ops.to_ipa(&plain_word)?;
         }
 
         self.entries.push(Entry {
@@ -1477,8 +1477,8 @@ mod test {
     fn test_always_generate_ipa() {
         struct IPAOps;
         impl LanguageOps for IPAOps {
-            fn to_ipa(&self, w: &str) -> Result<Option<String>> {
-                Ok(Some(format!("/{w}:{w}/")))
+            fn to_ipa(&self, w: &str) -> Result<Option<Node>> {
+                Ok(Some(Node::text(format!("/{w}:{w}/"))))
             }
         }
 
