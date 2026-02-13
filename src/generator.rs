@@ -1,5 +1,4 @@
 use std::{borrow::Cow};
-
 use serde::Serialize;
 use smallvec::SmallVec;
 use unicode_categories::UnicodeCategories;
@@ -357,23 +356,46 @@ impl Generator {
         // its last containing text node, if there is one, and if it doesn't
         // already end with a sentence delimiter (optionally followed by a
         // closing quotation mark).
-        fn add_full_stop(n: &mut Node) {
+        //
+        // If we can't append a full-stop, e.g. because the last node doesn't
+        // take an argument or because it is a macro whose content should not
+        // be modified (e.g. \ref), this returns 'false'.
+        fn add_full_stop(n: &mut Node) -> bool {
             match n {
                 Node::Text(t) | Node::Math(t) => {
                     if !t.as_str().trim_end_matches(&['\'', '"', '’', '”', '»', '›']).ends_with(&['.', '?', '!']) {
                         t.push('.');
                     }
+
+                    // Either we added a full stop or we don't need to add one.
+                    true
                 },
-                Node::Macro { args, .. } | Node::Group(args) => {
-                    if let Some(n) = args.last_mut() {
-                        add_full_stop(n);
+                Node::Macro { name, args } => {
+                    if *name != BuiltinMacro::Reference && let Some(n) = args.last_mut() {
+                        add_full_stop(n)
+                    } else if *name == BuiltinMacro::Ellipsis {
+                        true // Ellipsis should suppress full stop insertion.
+                    } else {
+                        false
                     }
                 },
-            };
+                Node::Group(args) => {
+                    if let Some(n) = args.last_mut() {
+                        // Append a new node if recursing fails.
+                        if !add_full_stop(n) { args.push(Node::text(".")); }
+                        true
+                    } else {
+                        // We shouldn't really encounter an empty group, but user-defined
+                        // functions might return one if a user decides to create one manually
+                        // for some ungodly reason.
+                        false
+                    }
+                },
+            }
         }
 
         let mut node = self.parse_tex(tex)?;
-        add_full_stop(&mut node);
+        if !add_full_stop(&mut node) { node = Node::group(vec![node, Node::text(".")]) }
         Ok(node)
     }
 
@@ -1391,7 +1413,243 @@ mod test {
                     }
                 ]
             }
-        "#)
+        "#);
+
+        // Test that full-stop insertion works properly in the presence of macros with no
+        // arguments or \ref.
+        check!("a|b|c|foo \\ref{bar}", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "pos": {
+                            "text": "b"
+                        },
+                        "etym": {
+                            "text": "c"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "group": [
+                                    {
+                                        "text": "foo "
+                                    },
+                                    {
+                                        "macro": {
+                                            "name": "reference",
+                                            "args": [
+                                                {
+                                                    "text": "bar"
+                                                }
+                                            ]
+                                        }
+                                    },
+                                    {
+                                        "text": "."
+                                    }
+                                ]
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": "foo"
+                    }
+                ]
+            }
+        "#);
+
+        check!("a|b|c|foo \\ref{bar}.", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "pos": {
+                            "text": "b"
+                        },
+                        "etym": {
+                            "text": "c"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "group": [
+                                    {
+                                        "text": "foo "
+                                    },
+                                    {
+                                        "macro": {
+                                            "name": "reference",
+                                            "args": [
+                                                {
+                                                    "text": "bar"
+                                                }
+                                            ]
+                                        }
+                                    },
+                                    {
+                                        "text": "."
+                                    }
+                                ]
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": "foo"
+                    }
+                ]
+            }
+        "#);
+
+        check!("a|b|c|foo \\ref{bar.}.", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "pos": {
+                            "text": "b"
+                        },
+                        "etym": {
+                            "text": "c"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "group": [
+                                    {
+                                        "text": "foo "
+                                    },
+                                    {
+                                        "macro": {
+                                            "name": "reference",
+                                            "args": [
+                                                {
+                                                    "text": "bar."
+                                                }
+                                            ]
+                                        }
+                                    },
+                                    {
+                                        "text": "."
+                                    }
+                                ]
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": "foo"
+                    }
+                ]
+            }
+        "#);
+
+        check!("a|b|c|foo \\this", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "pos": {
+                            "text": "b"
+                        },
+                        "etym": {
+                            "text": "c"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "group": [
+                                    {
+                                        "text": "foo "
+                                    },
+                                    {
+                                        "macro": {
+                                            "name": "this"
+                                        }
+                                    },
+                                    {
+                                        "text": "."
+                                    }
+                                ]
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": "foo"
+                    }
+                ]
+            }
+        "#);
+
+        check!("a|b|c|foo \\this.", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "pos": {
+                            "text": "b"
+                        },
+                        "etym": {
+                            "text": "c"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "group": [
+                                    {
+                                        "text": "foo "
+                                    },
+                                    {
+                                        "macro": {
+                                            "name": "this"
+                                        }
+                                    },
+                                    {
+                                        "text": "."
+                                    }
+                                ]
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": "foo"
+                    }
+                ]
+            }
+        "#);
+
+        check!("a|b|c|foo\\ldots", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "pos": {
+                            "text": "b"
+                        },
+                        "etym": {
+                            "text": "c"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "group": [
+                                    {
+                                        "text": "foo"
+                                    },
+                                    {
+                                        "macro": {
+                                            "name": "ellipsis"
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": "foo"
+                    }
+                ]
+            }
+        "#);
     }
 
     #[test]
