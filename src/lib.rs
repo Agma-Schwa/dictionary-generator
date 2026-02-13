@@ -20,6 +20,7 @@ pub enum BuiltinMacro {
     Subscript,
     Superscript,
     SoftHyphen,
+    Reference,
     This, // The current word.
 }
 

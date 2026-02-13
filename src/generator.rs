@@ -468,6 +468,7 @@ impl Generator {
             "senseref" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Sense),
             "Sup" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Superscript),
             "Sub" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Subscript),
+            "ref" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Reference),
             "par" => Ok(Node::builtin(BuiltinMacro::ParagraphBreak)),
             "ldots" => Ok(Node::builtin(BuiltinMacro::Ellipsis)),
             "this" => Ok(Node::builtin(BuiltinMacro::This)),
@@ -475,7 +476,7 @@ impl Generator {
                 self.err(&format!("Invalid use of '\\{}'", macro_name))?;
                 unreachable!();
             },
-            "ref" | "label" => {
+            "label" => {
                 let _ = self.parse_tex_group(s)?; // Throw away the argument.
                 Ok(Node::empty())
             }
@@ -676,9 +677,11 @@ mod test {
         check!("\\ldots", "{\"macro\":{\"name\":\"ellipsis\"}}");
         check!("\\this", "{\"macro\":{\"name\":\"this\"}}");
 
-        // Labels and refs are dropped.
-        check!("x\\ref{...abab{\\w{ss}}}y", "{\"text\":\"xy\"}");
+        // Labels are dropped.
         check!("x\\label{...abab{\\w{ss}}}y", "{\"text\":\"xy\"}");
+
+        // References are preserved.
+        check!("x\\ref{abab}y", "{\"group\":[{\"text\":\"x\"},{\"macro\":{\"name\":\"reference\",\"args\":[{\"text\":\"abab\"}]}},{\"text\":\"y\"}]}");
     }
 
     #[test]
