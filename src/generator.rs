@@ -32,7 +32,7 @@ enum EntryData {
         pos: Node,
 
         /// Etymology.
-        etym: Node,
+        #[serde(skip_serializing_if = "Option::is_none")] etym: Option<Node>,
 
         /// IPA.
         #[serde(skip_serializing_if = "Option::is_none")] ipa: Option<Node>,
@@ -266,9 +266,14 @@ impl Generator {
             return self.err("An entry must have at most 6 parts: word, part of speech, etymology, definition, forms, IPA");
         }
 
-        // Part of speech and etymology.
+        // Part of speech.
         let pos = self.parse_tex(&parts[Part::POS as usize])?;
-        let etym = self.parse_tex(&parts[Part::Etym as usize])?;
+
+        // Etymology.
+
+        let etym_str = &parts[Part::Etym as usize];
+        let mut etym = None;
+        if !etym_str.is_empty() { etym = Some(self.parse_tex(etym_str)?) }
 
         // The primary definition is everything before the first sense and doesn’t
         // count as a sense because it is either the only one or, if there are multiple
@@ -777,9 +782,6 @@ mod test {
                         "pos": {
                             "text": ""
                         },
-                        "etym": {
-                            "text": ""
-                        },
                         "primary_definition": {
                             "def": {
                                 "text": "c&d."
@@ -800,9 +802,6 @@ mod test {
                             "text": "q"
                         },
                         "pos": {
-                            "text": ""
-                        },
-                        "etym": {
                             "text": ""
                         },
                         "primary_definition": {
