@@ -465,7 +465,7 @@ impl Generator {
         if s.consume("-") { return Ok(Node::builtin(BuiltinMacro::SoftHyphen)) }
 
         // '\\' is invalid here.
-        if s.consume("\\") { self.err("Invalid use of '\\\\'")? }
+        if s.consume("\\") { self.err("'\\\\' cannot be used in this field")? }
 
         // These are treated literally.
         if s.text().starts_with(&[' ', '&', '$', '%', '#', '{', '}']) {
@@ -501,7 +501,7 @@ impl Generator {
             "ldots" => Ok(Node::builtin(BuiltinMacro::Ellipsis)),
             "this" => Ok(Node::builtin(BuiltinMacro::This)),
             "ex" | "comment" => {
-                self.err(&format!("Invalid use of '\\{}'", macro_name))?;
+                self.err(&format!("'\\{}' cannot be used in this field", macro_name))?;
                 unreachable!();
             },
             "label" => {
@@ -562,10 +562,11 @@ impl Generator {
         let mut comment = None;
         if s.consume(COMMENT_MACRO) {
             if def_str.is_empty() {
-                self.err("\\comment is not allowed in an empty sense or empty primary definition. Use \\textit{...} instead.")?
+                self.err("\\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead.")?
             }
 
             let comment_str = s.take_until(EX_MACRO).trim();
+            self.disallow_specials(comment_str, "a comment")?;
             comment = Some(self.parse_tex_and_add_full_stop(comment_str)?);
         }
 
@@ -580,6 +581,7 @@ impl Generator {
             let mut ex_comment = None;
             if s.consume(COMMENT_MACRO) {
                 let comment_str = s.take_until(EX_MACRO).trim();
+                self.disallow_specials(comment_str, "a comment")?;
                 ex_comment = Some(self.parse_tex_and_add_full_stop(comment_str)?);
             }
 
@@ -689,9 +691,9 @@ mod test {
         check_err!("\\", "Error near line 0: Invalid macro escape sequence");
 
         // Special macros aren't normally valid.
-        check_err!("\\\\", "Error near line 0: Invalid use of '\\\\'");
-        check_err!("\\ex", "Error near line 0: Invalid use of '\\ex'");
-        check_err!("\\comment", "Error near line 0: Invalid use of '\\comment'");
+        check_err!("\\\\", "Error near line 0: '\\\\' cannot be used in this field");
+        check_err!("\\ex", "Error near line 0: '\\ex' cannot be used in this field");
+        check_err!("\\comment", "Error near line 0: '\\comment' cannot be used in this field");
 
         // Builtin single-argument macros.
         check!("\\s{a}{b}", "{\"group\":[{\"macro\":{\"name\":\"small_caps\",\"args\":[{\"text\":\"a\"}]}},{\"text\":\"b\"}]}");
@@ -1665,12 +1667,12 @@ mod test {
 
         check_err!(
             "x|y|z|\\comment abcd",
-            "Error near line 1: \\comment is not allowed in an empty sense or empty primary definition. Use \\textit{...} instead."
+            "Error near line 1: \\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead."
         );
 
         check_err!(
             "x|y|z|\\\\\\comment abcd",
-            "Error near line 1: \\comment is not allowed in an empty sense or empty primary definition. Use \\textit{...} instead."
+            "Error near line 1: \\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead."
         );
 
         check_err!(
@@ -1732,6 +1734,35 @@ mod test {
             "a > \\\\",
             "Error near line 1: '\\\\' cannot be used in a reference entry"
         );
+
+        check_err!(
+            "a|b|c|d \\comment abc \\comment abc",
+            "Error near line 1: '\\comment' cannot be used in a comment"
+        );
+
+        check_err!("a\\comment|b|c|d", "Error near line 1: '\\comment' cannot be used in the lemma");
+        check_err!("a\\ex|b|c|d", "Error near line 1: '\\ex' cannot be used in the lemma");
+        check_err!("a\\\\|b|c|d", "Error near line 1: '\\\\' cannot be used in the lemma");
+
+        check_err!("a|b\\comment|c|d", "Error near line 1: '\\comment' cannot be used in this field");
+        check_err!("a|b\\ex|c|d", "Error near line 1: '\\ex' cannot be used in this field");
+        check_err!("a|b\\\\|c|d", "Error near line 1: '\\\\' cannot be used in this field");
+
+        check_err!("a|b|c\\comment|d", "Error near line 1: '\\comment' cannot be used in this field");
+        check_err!("a|b|c\\ex|d", "Error near line 1: '\\ex' cannot be used in this field");
+        check_err!("a|b|c\\\\|d", "Error near line 1: '\\\\' cannot be used in this field");
+
+        check_err!("a|b|c|d|\\comment", "Error near line 1: '\\comment' cannot be used in this field");
+        check_err!("a|b|c|d|\\ex", "Error near line 1: '\\ex' cannot be used in this field");
+        check_err!("a|b|c|d|\\\\", "Error near line 1: '\\\\' cannot be used in this field");
+
+        check_err!("a > b \\comment", "Error near line 1: '\\comment' cannot be used in a reference entry");
+        check_err!("a > b \\ex", "Error near line 1: '\\ex' cannot be used in a reference entry");
+        check_err!("a > b \\\\", "Error near line 1: '\\\\' cannot be used in a reference entry");
+
+        check_err!("a\\comment > b", "Error near line 1: '\\comment' cannot be used in a reference entry");
+        check_err!("a\\ex > b", "Error near line 1: '\\ex' cannot be used in a reference entry");
+        check_err!("a\\\\ > b", "Error near line 1: '\\\\' cannot be used in a reference entry");
     }
 
     #[test]
