@@ -30,11 +30,24 @@ pub type Nodes = Vec<Node>;
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum Node {
+    /// Text node.
     Text(String),
+
+    /// Math node.
     Math(String),
+
+    /// A group of nodes to be rendered directly adjacent to one another.
     Group(Nodes),
+
+    /// A builtin macro; all renderers are expected to support all builtin macros.
     Macro {
         name: BuiltinMacro,
+        #[serde(skip_serializing_if = "Nodes::is_empty")] args: Nodes
+    },
+
+    /// Projects may define their own custom macros.
+    CustomMacro {
+        name: String,
         #[serde(skip_serializing_if = "Nodes::is_empty")] args: Nodes
     },
 }
@@ -60,6 +73,10 @@ impl Node {
         // We don't try and fold builtin macros because no-one should actually
         // ever write e.g. nested \textit{} in practice.
         Node::Macro { name: m, args }
+    }
+
+    pub fn custom(m: String, args: Nodes) -> Node {
+        Node::CustomMacro { name: m, args }
     }
 
     pub fn group(mut children: Nodes) -> Node {
@@ -90,7 +107,7 @@ impl Node {
                 Node::Group(args) => {
                     for a in args { render_impl(s, a, strip_macros) }
                 }
-                Node::Macro { args, .. } => {
+                Node::Macro { args, .. } | Node::CustomMacro { args, .. } => {
                     if !strip_macros {
                         for a in args { render_impl(s, a, strip_macros) }
                     }

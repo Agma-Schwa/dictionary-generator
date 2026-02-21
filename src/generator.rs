@@ -384,6 +384,7 @@ impl Generator {
                         false
                     }
                 },
+                Node::CustomMacro { .. } => false, // Do not attempt to recurse into custom macros.
                 Node::Group(args) => {
                     if let Some(n) = args.last_mut() {
                         // Append a new node if recursing fails.
@@ -1762,6 +1763,76 @@ mod test {
                     "primary_definition": {
                         "def": {
                             "text": "d."
+                        }
+                    }
+                }
+            ]
+        }"#);
+    }
+
+    #[test]
+    fn test_custom_macro() {
+        struct Ops;
+        impl LanguageOps for Ops {
+            fn handle_unknown_macro(&self, macro_name: &str, args: Nodes) -> Result<Node> {
+                Ok(Node::custom(macro_name.to_string(), args))
+            }
+        }
+
+        let t = Box::new(Ops {});
+        let mut g = Generator::new(t, Default::default());
+        check_with_generator!(g, "a|b|c|\\foo{bar}{quux}\\baz\\bar{xyz}\\baz", r#" {
+            "entries": [
+                {
+                    "word": {
+                        "text": "a"
+                    },
+                    "pos": {
+                        "text": "b"
+                    },
+                    "etym": {
+                        "text": "c"
+                    },
+                    "primary_definition": {
+                        "def": {
+                            "group": [
+                                {
+                                    "custom_macro": {
+                                        "name": "foo",
+                                        "args": [
+                                            {
+                                                "text": "bar"
+                                            },
+                                            {
+                                                "text": "quux"
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "custom_macro": {
+                                        "name": "baz"
+                                    }
+                                },
+                                {
+                                    "custom_macro": {
+                                        "name": "bar",
+                                        "args": [
+                                            {
+                                                "text": "xyz"
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "custom_macro": {
+                                        "name": "baz"
+                                    }
+                                },
+                                {
+                                    "text": "."
+                                }
+                            ]
                         }
                     }
                 }
