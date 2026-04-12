@@ -95,6 +95,10 @@ impl Generator {
         Err(format!("Error near line {}: {}", self.line, msg))
     }
 
+    fn handle_user_err<T>(&self, e: Result<T>) -> Result<T> {
+        e.map_err(|e| self.err(&format!("{}", e)).unwrap_err())
+    }
+
     pub(crate) fn new(ops: Box<dyn LanguageOps>, opts: Options) -> Self {
         Generator {
             line: 0,
@@ -255,7 +259,7 @@ impl Generator {
         }
 
         // Preprocessing happens on raw strings before parsing.
-        self.ops.preprocess_full_entry(&mut parts)?;
+        self.handle_user_err(self.ops.preprocess_full_entry(&mut parts))?;
 
         // Make sure we have enough parts as well as not too many parts.
         if parts.len() < MIN_PARTS {
@@ -326,7 +330,7 @@ impl Generator {
 
         // If requested, generate IPA.
         if ipa.is_none() && self.opts.always_include_ipa {
-            ipa = self.ops.to_ipa(&plain_word)?;
+            ipa = self.handle_user_err(self.ops.to_ipa(&plain_word))?;
         }
 
         self.entries.push(Entry {
@@ -474,8 +478,8 @@ impl Generator {
 
         // These are unsupported single-character macros.
         if s.text().starts_with(&['!', '/', ':', '@', '[', ']', '`', '{', '~']) {
-            return self.ops.handle_unknown_macro(&s.take_byte().unwrap().to_string(), vec![]).map_err(|e|
-                format!("Error near line {}: {}", self.line, e)
+            return self.handle_user_err(
+                self.ops.handle_unknown_macro(&s.take_byte().unwrap().to_string(), vec![])
             );
         }
 
@@ -511,9 +515,7 @@ impl Generator {
             _ => {
                 let mut args = Nodes::new();
                 while s.starts_with("{") { args.push(self.parse_tex_group(s)?); }
-                self.ops.handle_unknown_macro(macro_name, args).map_err(|e|
-                    format!("Error near line {}: {}", self.line, e)
-                )
+                self.handle_user_err(self.ops.handle_unknown_macro(macro_name, args))
             }
         }
     }
@@ -1869,5 +1871,27 @@ mod test {
                 }
             ]
         }"#);
+    }
+
+    // Test that preprocess_full_entry() includes a source location.
+    #[test]
+    fn test_preprocess_full_entry() {
+        struct Ops {}
+        impl LanguageOps for Ops {
+            fn preprocess_full_entry(&self, _entry: &mut [Cow<'_, str>]) -> Result<()> {
+                Err("foobar".to_string())
+            }
+        }
+
+        let t = Box::new(Ops {});
+        let mut g = Generator::new(t, Default::default());
+
+        macro_rules! check_err {
+            ($in:literal, $out:literal) => {
+                assert_eq!(g.parse($in).unwrap_err(), $out);
+            };
+        }
+
+        check_err!("a|b|c|d", "Error near line 1: foobar");
     }
 }
