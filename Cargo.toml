@@ -3,12 +3,26 @@ name = "dictgen"
 version = "0.3.0"
 edition = "2024"
 
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+name = "dictgen"
+
+[[bin]]
+name = "generator"
+path = "src/main.rs"
+
 [dependencies]
 serde_json = "1.0.149"
 unicode-normalization = "0.1.25"
 serde = { version = "1.0.228", features = ["derive"] }
 smallvec = { version = "1.15.1", features = ["serde"] }
 unicode_categories = "0.1.1"
-
-[dev-dependencies]
+memchr = "2.8.0"
+lazy_static = "1.5.0"
+aho-corasick = "1.1.4"
+smallstr = { version = "0.3.1", features = ["serde"] }
+clap = { version = "4.6.1", features = ["derive"] }
+wasm-minimal-protocol = "0.2.0"
+fancy-regex = "0.18.0"
 json = "0.12.4"

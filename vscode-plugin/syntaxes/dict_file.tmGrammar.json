@@ -1,0 +1,244 @@
+{
+    "scopeName": "source.dict_file",
+    "patterns": [
+        { "include": "#comment" },
+        { "include": "#directive_ipa" },
+        { "include": "#directive_preprocess" },
+        { "include": "#directive_collate" },
+        { "include": "#directive_declare" },
+        { "include": "#delimiter" },
+        { "include": "#keyword" },
+        { "include": "#macro" },
+        { "include": "#macro_with_arg" },
+        { "include": "#custom_macro_with_arg" },
+        { "include": "#custom_macro" },
+        { "include": "#escape" },
+        { "include": "#directive" },
+        { "include": "#invalid" }
+    ],
+    "repository": {
+        "comment": {
+            "match": "#[^\n]*",
+            "name": "comment.line"
+        },
+        "directive_ipa": {
+            "begin": "^(\\$ipa)\\b\\s*(\\{)",
+            "end": "\\}",
+            "beginCaptures": {
+                "1": { "name": "entity.name.type" },
+                "2": { "name": "keyword.operator" }
+            },
+            "endCaptures": {
+                "0": { "name": "keyword.operator" }
+            },
+            "patterns": [
+                { "include": "#directive_string_simple" },
+                { "include": "#directive_string_trie" },
+                { "include": "#directive_string_subst" },
+                { "include": "#directive_ipa_lemma" },
+                { "include": "#comment" }
+            ]
+        },
+        "directive_ipa_lemma": {
+            "begin": "(\\lemma)\\b\\s*(\\{)",
+            "end": "\\}",
+            "beginCaptures": {
+                "1": { "name": "entity.name.function" },
+                "2": { "name": "keyword.operator" }
+            },
+            "endCaptures": {
+                "0": { "name": "keyword.operator" }
+            },
+            "patterns": [
+                { "include": "#directive_string_simple" },
+                { "include": "#directive_string_trie" },
+                { "include": "#directive_string_subst" },
+                { "include": "#comment" },
+                { "include": "#directive_ipa_lemma" }
+            ]
+        },
+        "directive_preprocess": {
+            "begin": "^(\\$preprocess)\\b\\s*(\\{)",
+            "end": "\\}",
+            "beginCaptures": {
+                "1": { "name": "entity.name.type" },
+                "2": { "name": "keyword.operator" }
+            },
+            "endCaptures": {
+                "0": { "name": "keyword.operator" }
+            },
+            "patterns": [
+                {
+                    "begin": "\\b(pos|etym|def|forms|ipa)\\b\\s*(\\{)",
+                    "end": "\\}",
+                    "beginCaptures": {
+                        "1": { "name": "constant.language" },
+                        "2": { "name": "keyword.operator" }
+                    },
+                    "endCaptures": {
+                        "0": { "name": "keyword.operator" }
+                    },
+                    "patterns": [
+                        { "include": "#directive_string_simple" },
+                        { "include": "#directive_string_trie" },
+                        { "include": "#directive_string_subst" },
+                        { "include": "#directive_match" },
+                        { "include": "#comment" }
+                    ]
+                },
+                { "include": "#comment" }
+            ]
+        },
+        "directive_collate": {
+            "begin": "^(\\$collate)\\b\\s*(\\{)",
+            "end": "\\}",
+            "beginCaptures": {
+                "1": { "name": "entity.name.type" },
+                "2": { "name": "keyword.operator" }
+            },
+            "endCaptures": {
+                "0": { "name": "keyword.operator" }
+            },
+            "patterns": [
+                {
+                    "match": "\\b(by)\\b\\s*(\"[^\"]+\")",
+                    "captures": {
+                        "1": { "name" : "entity.name.function" },
+                        "2": { "name" : "string.quoted" }
+                    }
+                },
+                {
+                    "begin": "\\b(preprocess)\\b\\s*(\\{)",
+                    "end": "\\}",
+                    "beginCaptures": {
+                        "1": { "name": "entity.name.function" },
+                        "2": { "name": "keyword.operator" }
+                    },
+                    "endCaptures": {
+                        "0": { "name": "keyword.operator" }
+                    },
+                    "patterns": [
+                        { "include": "#directive_string_simple" },
+                        { "include": "#directive_string_trie" },
+                        { "include": "#directive_string_subst" },
+                        { "include": "#comment" }
+                    ]
+                }
+            ]
+        },
+        "directive_declare": {
+            "match": "^(\\$declare)\\b\\s+([^ ]+)\\s+([0-9]+)",
+            "captures": {
+                "1": { "name": "entity.name.type" },
+                "2": { "name": "entity.name.function.dictgen-custom-macro" },
+                "3": { "name": "constant.numeric" }
+            }
+        },
+        "directive_string_simple": {
+            "match": "\\b(lower|nfc|nfd|nfkc|nfkd|remove_punct)\\b",
+            "name": "entity.name.function"
+        },
+        "directive_string_trie": {
+            "begin": "\\b(trie)\\b\\s*(\\()\\s*\\b(nfc|nfd|nfkd|nfkc)\\b\\s*(\\))\\s*(\\{)",
+            "end": "\\}",
+            "beginCaptures": {
+                "1": { "name": "entity.name.function" },
+                "2": { "name": "keyword.operator" },
+                "3": { "name": "entity.name.function" },
+                "4": { "name": "keyword.operator" },
+                "5": { "name": "keyword.operator" }
+            },
+            "endCaptures": {
+                "0": { "name": "keyword.operator" }
+            },
+            "patterns": [
+                {
+
+                    "match": "(?:(?:(\\[)((?:[^\\]]|\\\\])+)(\\]))|([^ \\[\\]]+))\\s+(=>)\\s+([^ ]+)",
+                    "captures": {
+                        "1": { "name": "keyword.operator" },
+                        "2": { "name": "string.regexp" },
+                        "3": { "name": "keyword.operator" },
+                        "4": { "name": "string.unquoted" },
+                        "5": { "name": "keyword.operator" },
+                        "6": { "name": "string.unquoted" }
+                    }
+                },
+                { "include": "#comment" }
+            ]
+        },
+        "directive_string_subst": {
+            "match": "(s)([/|%])(.+)(\\2)(.*?)(\\2)",
+            "captures": {
+                "1": { "name": "entity.name.function" },
+                "2": { "name": "entity.name.function" },
+                "3": { "name": "string.regexp" },
+                "4": { "name": "entity.name.function" },
+                "5": { "name": "string.unquoted" },
+                "6": { "name": "entity.name.function" }
+            }
+        },
+        "directive_match": {
+            "match": "(!?m)([/|%])(.+)(\\2)\\s*(\"[^\"]+\")?",
+            "captures": {
+                "1": { "name": "entity.name.function" },
+                "2": { "name": "entity.name.function" },
+                "3": { "name": "string.regexp" },
+                "4": { "name": "entity.name.function" },
+                "5": { "name": "string.quoted" }
+            }
+        },
+        "delimiter": {
+            "match": "\\||\\\\\\\\|>",
+            "name": "keyword.operator"
+        },
+        "keyword": {
+            "match": "\\\\(ex|comment)",
+            "name": "keyword.other"
+        },
+        "escape": {
+            "match": "\\\\( |&|\\$|%|#|\\{|\\})",
+            "name": "constant.character.escape"
+        },
+        "macro_with_arg": {
+            "begin": "\\\\(s|w|i|b|textit|textbf|textnf|senseref|Sup|Sub|ref|label|pf|psc)\\{",
+            "end": "\\}",
+            "beginCaptures": {
+                "0": { "name": "entity.name.function" }
+            },
+            "endCaptures": {
+                "0": { "name": "entity.name.function" }
+            },
+            "name": "macrocall",
+            "patterns": [{ "include": "$self" }]
+        },
+        "macro": {
+            "match": "\\\\(par|ldots|this|N|L|-)|~|\\{\\}",
+            "name": "entity.name.function"
+        },
+        "custom_macro_with_arg": {
+            "begin": "\\\\([a-zA-Z]+)\\{",
+            "end": "\\}",
+            "beginCaptures": {
+                "0": { "name": "entity.name.function.dictgen-custom-macro" }
+            },
+            "endCaptures": {
+                "0": { "name": "entity.name.function.dictgen-custom-macro" }
+            },
+            "name": "macrocall",
+            "patterns": [{ "include": "$self" }]
+        },
+        "custom_macro": {
+            "match": "\\\\([a-zA-Z]+)",
+            "name": "entity.name.function.dictgen-custom-macro"
+        },
+        "invalid": {
+            "match": "\\$|&|%|\\\\|\\^|_|\\{|\\}",
+            "name": "invalid.illegal"
+        },
+        "directive": {
+            "match": "\\$(backend) (all|json|tex)",
+            "name": "entity.name.section"
+        }
+    }
+}

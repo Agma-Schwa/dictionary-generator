@@ -1,8 +1,9 @@
-use std::{borrow::Cow, cmp::Ordering};
 use serde::Serialize;
+use smallstr::SmallString;
 
-mod generator;
+pub mod generator;
 mod string_utils;
+mod wasm;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -25,16 +26,17 @@ pub enum BuiltinMacro {
 }
 
 pub type Nodes = Vec<Node>;
+type NodeText = SmallString<[u8; 16]>;
 
 /// A node that represents formatting or text.
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum Node {
     /// Text node.
-    Text(String),
+    Text(NodeText),
 
     /// Math node.
-    Math(String),
+    Math(NodeText),
 
     /// A group of nodes to be rendered directly adjacent to one another.
     Group(Nodes),
@@ -47,7 +49,7 @@ pub enum Node {
 
     /// Projects may define their own custom macros.
     CustomMacro {
-        name: String,
+        name: NodeText,
         #[serde(skip_serializing_if = "Nodes::is_empty")] args: Nodes
     },
 }
@@ -64,6 +66,29 @@ pub struct Options {
     pub pretty_json: bool,
 }
 
+// You can't define a function that is generic on mutability, so the sledgehammer
+// approach will have to do.
+macro_rules! define_node_traversal_function {
+    ($name:ident, $node:ty, $arg:ty $(, $mutability:tt)?) => {
+        fn $name<F: FnMut($arg)>(n: $node, callback: &mut F, visit_macro_args: bool) {
+            match n {
+                Node::Text(_) | Node::Math(_) => callback(n),
+                Node::Group(args) => {
+                    for a in args { $name(a, callback, visit_macro_args) }
+                }
+                Node::Macro { args, .. } | Node::CustomMacro { args, .. } => {
+                    if visit_macro_args {
+                        for a in args { $name(a, callback, visit_macro_args) }
+                    }
+                }
+            }
+        }
+    };
+}
+
+define_node_traversal_function!(_traverse_text_node, &Node, &Node);
+define_node_traversal_function!(_traverse_text_node_mut, &mut Node, &mut Node, mut);
+
 impl Node {
     pub fn builtin(m: BuiltinMacro) -> Node {
         Node::Macro { name: m, args: vec![] }
@@ -75,8 +100,8 @@ impl Node {
         Node::Macro { name: m, args }
     }
 
-    pub fn custom(m: String, args: Nodes) -> Node {
-        Node::CustomMacro { name: m, args }
+    pub fn custom(m: &str, args: Nodes) -> Node {
+        Node::CustomMacro { name: m.into(), args }
     }
 
     pub fn group(mut children: Nodes) -> Node {
@@ -100,31 +125,33 @@ impl Node {
         serde_json::to_string(self).unwrap()
     }
 
-    pub fn render_plain_text(&self, strip_macros: bool) -> String {
-        fn render_impl(s: &mut String, n: &Node, strip_macros: bool) {
-            match n {
-                Node::Text(t) | Node::Math(t) => s.push_str(t),
-                Node::Group(args) => {
-                    for a in args { render_impl(s, a, strip_macros) }
-                }
-                Node::Macro { args, .. } | Node::CustomMacro { args, .. } => {
-                    if !strip_macros {
-                        for a in args { render_impl(s, a, strip_macros) }
-                    }
-                }
-            }
-        }
-
-        let mut s = String::new();
-        render_impl(&mut s, self, strip_macros);
+    pub fn render_plain_text(&self, strip_macros: bool) -> NodeText {
+        let mut s = NodeText::new();
+        self.visit_text_nodes(!strip_macros, |t| s.push_str(t.unwrap_text()));
         s
     }
 
-    pub fn text(s: impl Into<String>) -> Node {
+    pub fn text(s: impl Into<SmallString<[u8; 16]>>) -> Node {
         Node::Text(s.into())
+    }
+
+    pub fn unwrap_text(&self) -> &str {
+        match self {
+            Node::Text(t) | Node::Math(t) => t,
+            _ => panic!("Not a text node!"),
+        }
+    }
+
+    pub fn visit_text_nodes<F: FnMut(&Node)>(&self, visit_macro_args: bool, mut f: F) {
+        _traverse_text_node(self, &mut f, visit_macro_args);
+    }
+
+    pub fn visit_text_nodes_mut<F: FnMut(&mut Node)>(&mut self, visit_macro_args: bool, mut f: F) {
+        _traverse_text_node_mut(self, &mut f, visit_macro_args);
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum Part {
     /// Part of speech.
     POS,
@@ -145,42 +172,12 @@ pub enum Part {
     Max,
 }
 
-/// Trait that should be customised for each 'language' i.e. dictionary implementation;
-/// this is the main customisation point of the generator.
-pub trait LanguageOps {
-    /// Sort headwords. Should return 'true' if 'a' is to be sorted before 'b'.
-    fn collate(&self, a: &str, b: &str, a_nfkd: &str, b_nfkd: &str) -> Ordering {
-        if a_nfkd == b_nfkd { a.cmp(b) }
-        else { a_nfkd.cmp(b_nfkd) }
-    }
-
-    /// Invoked on any unknown macro. 'macro_name' does not include the backslash.
-    fn handle_unknown_macro(
-        &self,
-        macro_name: &str,
-        _args: Nodes,
-    ) -> Result<Node> {
-        Err(format!("Unsupported macro '\\{}'. Please add support for it to the dictionary generator.", macro_name))
-    }
-
-    /// Preprocess the fields before conversion/parsing is attempted.
-    fn preprocess_full_entry(&self, _entry: &mut [Cow<'_, str>]) -> Result<()> {
-        Ok(())
-    }
-
-    /// Convert a language’s text to IPA.
-    fn to_ipa(&self, _word: &str) -> Result<Option<Node>> {
-        Ok(None)
-    }
-}
-
 /// Parse a string as a dictionary file and return the JSON string.
 pub fn parse_and_generate(
-    ops: Box<dyn LanguageOps>,
     input: &str,
     opts: Options,
 ) -> Result<String> {
-    let mut g = generator::Generator::new(ops, opts);
+    let mut g = generator::Generator::new(opts);
     g.parse(input)?;
     Ok(g.json())
 }

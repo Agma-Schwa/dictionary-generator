@@ -1,26 +1,22 @@
-use std::{borrow::Cow};
+use aho_corasick::{AhoCorasick, MatchKind};
 use serde::Serialize;
 use smallvec::SmallVec;
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use fancy_regex::Regex;
 use unicode_categories::UnicodeCategories;
 use unicode_normalization::UnicodeNormalization;
+use crate::{string_utils::*, BuiltinMacro, Node, Nodes, Options, Part, Result};
 
-use crate::{Node, Nodes, BuiltinMacro, string_utils::*, Options};
-
-use crate::{LanguageOps, Part, Result};
-
-const SENSE_MACRO: &str = "\\\\";
-const EX_MACRO: &str = "\\ex";
-const COMMENT_MACRO: &str = "\\comment";
-
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Entry {
     word: Node,
-    #[serde(skip)] nfkd: String,
-    #[serde(skip)] word_for_sorting: String,
+    #[serde(skip)] collated_word: SmallStr,
+    #[serde(skip)] plain_text_word: SmallStr,
     #[serde(flatten)] data: EntryData,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum EntryData {
     RefEntry {
@@ -56,185 +52,1037 @@ enum EntryData {
 }
 
 use EntryData::*;
+use crate::generator::StringReplacementOp::{Lower, RemovePunct};
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Sense {
     def: Node,
     #[serde(skip_serializing_if = "Option::is_none")] comment: Option<Node>,
     #[serde(skip_serializing_if = "Vec::is_empty")] examples: Vec<Example>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Example {
     text: Node,
     #[serde(skip_serializing_if = "Option::is_none")] comment: Option<Node>,
 }
 
+#[derive(Debug, Default)]
 pub struct Generator {
-    line: u32, // The current line.
-    ops: Box<dyn LanguageOps>,
     entries: Vec<Entry>,
     opts: Options,
+    ipa_converter: Vec<StringReplacementOp>,
+    preprocessor: Vec<PreprocessDirective>,
+    custom_macros: Vec<CustomMacroDecl>,
+    collate: Option<CollateDirective>
 }
 
-impl Generator {
+// Source location info for a parser.
+struct ParserContext<'s> {
+    /// The entire input we're parsing. We don't use 'str' since we want to
+    /// be able to index into it.
+    full_input_text: &'s [u8],
+
+    /// The offset to the start of the current thing we're parsing; used for
+    /// diagnostics. Unfortunately, we can't just use the text we're parsing
+    /// for this since we may perform concatenation in some cases, which then
+    /// causes the text we're operating on to no longer be part of the original
+    /// input text.
+    loc: u32,
+}
+
+struct Parser<'s> {
+    context: ParserContext<'s>,
+
+    /// The text that we still need to parse.
+    text: Stream<'s>,
+
+    /// Generator we’re parsing into.
+    g: &'s mut Generator,
+}
+
+struct TeXParser<'a> {
+    context: &'a ParserContext<'a>,
+    custom_macros: &'a [CustomMacroDecl],
+}
+
+type SmallStr = super::NodeText;
+
+/// Normalisation applied before a trie.
+#[derive(Debug, Copy, Clone)]
+enum NormalisationForm {
+    NFC,
+    NFD,
+    NFKC,
+    NFKD,
+}
+
+impl NormalisationForm {
+    fn apply(self, s: &str) -> SmallStr {
+        match self {
+            NormalisationForm::NFC => s.nfc().collect(),
+            NormalisationForm::NFD => s.nfd().collect(),
+            NormalisationForm::NFKC => s.nfkc().collect(),
+            NormalisationForm::NFKD => s.nfkd().collect(),
+        }
+    }
+}
+
+/// Operation to convert text to IPA.
+#[derive(Debug)]
+enum StringReplacementOp {
+    /// Contains a list of replacements that are only applied
+    /// if we're converting a lemma to IPA.
+    Lemma(Vec<StringReplacementOp>),
+
+    /// Convert to lowercase.
+    Lower,
+
+    /// Normalise the input.
+    Normalise(NormalisationForm),
+
+    /// Remove punctuation marks.
+    RemovePunct,
+
+    /// Perform regex substitution.
+    Subst { regex: Regex, replacement: SmallStr },
+
+    /// Apply a trie.
+    Trie {
+        trie: AhoCorasick,
+        normalisation: Option<NormalisationForm>,
+        replacements: Vec<SmallStr>
+    },
+}
+
+#[derive(Debug)]
+struct PreprocessDirective {
+    field: Part,
+    op: PreprocessOp,
+}
+
+#[derive(Debug)]
+enum PreprocessOp {
+    Match { negated: bool, regex: Regex, message: Option<String> },
+    Replace(StringReplacementOp)
+}
+
+#[derive(Debug)]
+struct CustomMacroDecl {
+    name: SmallStr,
+    args: u32,
+    line: u32,
+}
+
+#[derive(Debug)]
+struct CollateDirective {
+    by: Option<SmallVec<[char; 32]>>,
+    ops: Vec<StringReplacementOp>,
+    line: u32,
+}
+
+impl CollateDirective {
+    fn make_default() -> Self {
+        Self {
+            by: None,
+            line: 0,
+            ops: vec![
+                StringReplacementOp::Normalise(NormalisationForm::NFKD),
+                RemovePunct,
+                StringReplacementOp::Normalise(NormalisationForm::NFC),
+                Lower,
+            ]
+        }
+    }
+}
+
+enum SmallCow<'a> {
+    Small(SmallStr),
+    Std(String),
+    Borrowed(&'a str),
+}
+
+impl<'a> SmallCow<'a> {
+    fn as_bytes(&'a self) -> &'a [u8] {
+        self.as_str().as_bytes()
+    }
+
+    fn as_str(&'a self) -> &'a str {
+        match self {
+            SmallCow::Small(s) => s.as_str(),
+            SmallCow::Std(s) => s.as_str(),
+            SmallCow::Borrowed(s) => s,
+        }
+    }
+
+    fn into_small(self) -> SmallStr {
+        match self {
+           SmallCow::Small(s) => s,
+           SmallCow::Std(s) => s.into(),
+           SmallCow::Borrowed(s) => s.into(),
+        }
+    }
+}
+
+const SENSE_MACRO: &[u8] = b"\\\\";
+const EX_MACRO: &[u8] = b"\\ex";
+const COMMENT_MACRO: &[u8] = b"\\comment";
+
+/// Normalise a string so it can be used for searching by the frontend.
+fn normalise_for_search(text: &str) -> String {
+    // NFKD; Latin-ASCII; [^a-z A-Z\\ ] Remove; Lower
+    let text: String = text
+        .nfkd()
+        .filter(|c| c.is_ascii_alphabetic() || *c == ' ')
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+
+    // The steps below only apply to the haystack, not the needle, and should
+    // NOT be applied on the frontend:
+    //
+    // Yeet all instances of 'sbdsth', which is what 'sbd./sth.' degenerates to.
+    let text = text.replace("sbdsth", "");
+
+    // Unique all words and sort them.
+    let mut words: Vec<&str> = text.trim().split(" ").filter(|c|!c.is_empty()).collect();
+    words.sort();
+    words.dedup();
+    words.join(" ")
+}
+
+/// Convert a byte slice to a str
+fn make_str(s: &[u8]) -> &str {
+    if cfg!(debug_assertions) {
+        str::from_utf8(s).unwrap()
+    } else {
+        // Safety: All of our string parsing splits strings at ASCII characters, which
+        // means that if the original string as UTF-8, so are any of the parts we split
+        // off.
+        unsafe { str::from_utf8_unchecked(s) }
+    }
+}
+
+fn make_err(c: &ParserContext, msg: &str) -> String {
+    let line = 1 + Stream::new(&c.full_input_text[..(c.loc as usize)]).count(b'\n');
+    format!("Error near line {}: {}", line, msg)
+}
+
+impl<'a> ParserContext<'a> {
+    fn save_offset(&mut self, text: &[u8]) {
+        self.loc = self.full_input_text.element_offset(&text[0]).unwrap() as u32
+    }
+}
+
+impl<'a> TeXParser<'a> {
+    fn err(&self, msg: &str) -> Result<()> {
+        Err(make_err(&self.context, msg))
+    }
+
+    /// Handle an unknown macro.
+    fn handle_unknown_macro(
+        &self,
+        macro_name: &[u8],
+        args: Nodes,
+    ) -> Result<Node> {
+        for m in self.custom_macros {
+            if m.name.as_bytes() == macro_name {
+                if m.args != args.len() as u32 {
+                    self.err(&format!(
+                        "Macro '\\{}' expects {} argument{}, but got {}",
+                        m.name,
+                        m.args,
+                        if m.args == 1 { "" } else { "s" },
+                        args.len()
+                    ))?
+                }
+
+                // Ok, argument count matches.
+                return Ok(Node::CustomMacro { name: m.name.clone(), args })
+            }
+        }
+
+        let name = make_str(macro_name);
+        Err(make_err(&self.context, &format!(
+            "Unknown macro '\\{}'; did you forget to '$declare {} {}' somewhere?",
+            name,
+            name,
+            args.len()
+        )))
+    }
+
+    #[allow(unused)] // Function used by the WASM bindings.
+    pub fn parse(tex: &[u8], custom_macros: &[CustomMacroDecl]) -> Result<Node> {
+        let ctx = ParserContext { full_input_text: tex, loc: 0 };
+        Self::parse_with_context(tex, &ctx, custom_macros)
+    }
+
+    fn parse_with_context(
+        tex: &[u8],
+        context: &ParserContext,
+        custom_macros: &[CustomMacroDecl]
+    ) -> Result<Node> {
+        let p = TeXParser { context, custom_macros };
+        p.parse_tex(tex)
+    }
+
+    fn parse_tex(&self, tex: &[u8]) -> Result<Node> {
+        let mut s = Stream::new(tex);
+        let mut nodes = Nodes::new();
+        s.trim();
+        while !s.is_empty() { self.parse_tex_content(&mut s, &mut nodes, 0)? }
+        Ok(Node::group(nodes))
+    }
+
+    fn parse_tex_content(&self, s: &mut Stream, nodes: &mut Nodes, mut braces: i32) -> Result<()> {
+        while !s.is_empty() {
+            // Append to an existing text node if possible and drop empty nodes.
+            fn push_node(nodes: &mut Nodes, n: Node) {
+                if let Node::Text(t) = n {
+                    if t.is_empty() { return }
+                    if !nodes.is_empty() && let Node::Text(prev) = nodes.last_mut().unwrap() {
+                        prev.push_str(&t);
+                        return
+                    }
+                    nodes.push(Node::Text(t));
+                } else {
+                    nodes.push(n);
+                }
+            }
+
+            let text = s.take_until_any(b"\\${}");
+            push_node(nodes, Node::text(make_str(text)));
+
+            // Process the special character.
+            match s.front().unwrap_or(b'\0') {
+                b'\\' => push_node(nodes, self.parse_tex_macro(s)?),
+                b'$' => push_node(nodes, self.parse_tex_maths(s)?),
+                b'{' => {
+                    s.drop_byte();
+                    braces += 1;
+                },
+                b'}' => {
+                    s.drop_byte();
+                    braces -= 1;
+                    if braces == 0 { return Ok(()) }
+                    if braces < 0 { return self.err("Too many '}'s!") }
+                }
+                _ => break,
+            }
+        }
+
+        // If 'braces' is initially 0, it’s possible for us to get here without
+        // ever encountering a closing brace. This happens frequently if this
+        // function is invoked at the top-level of the parser.
+        if braces != 0 { self.err("Unexpected end of input. Did you forget a '}}'?") }
+        else { Ok(()) }
+    }
+
+    fn parse_tex_group(&self, s: &mut Stream) -> Result<Node> {
+        assert!(s.consume(b"{"));
+        if s.consume(b"}") { return Ok(Node::empty()) }
+        let mut children = Nodes::new();
+        self.parse_tex_content(s, &mut children, 1)?;
+        Ok(Node::group(children))
+    }
+
+    fn parse_tex_macro(&self, s: &mut Stream) -> Result<Node> {
+        assert!(s.consume(b"\\"));
+        if s.is_empty() { self.err("Invalid macro escape sequence")? }
+
+        // Soft hyphen.
+        if s.consume(b"-") { return Ok(Node::builtin(BuiltinMacro::SoftHyphen)) }
+
+        // '\\' is invalid here.
+        if s.consume(b"\\") { self.err("'\\\\' cannot be used in this field")? }
+
+        // These are treated literally.
+        if s.starts_with_any(b" &$%#{}") {
+            return Ok(Node::text(make_str(&[s.take_byte().unwrap()])))
+        }
+
+        // These are unsupported single-character macros.
+        if s.starts_with_any(b"!/:@[]`{~") {
+            return self.handle_unknown_macro(&[s.take_byte().unwrap()], vec![]);
+        }
+
+        // Handle builtin macros.
+        let macro_name = s.take_while_any(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ@");
+        match macro_name {
+            b"s" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::SmallCaps),
+            b"w" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Lemma),
+            b"textit" | b"i" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Italic),
+            b"textbf" | b"b" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Bold),
+            b"textnf" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Normal),
+            b"senseref" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Sense),
+            b"Sup" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Superscript),
+            b"Sub" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Subscript),
+            b"ref" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Reference),
+            b"par" => Ok(Node::builtin(BuiltinMacro::ParagraphBreak)),
+            b"ldots" => Ok(Node::builtin(BuiltinMacro::Ellipsis)),
+            b"this" => Ok(Node::builtin(BuiltinMacro::This)),
+            b"ex" | b"comment" => {
+                self.err(&format!("'\\{}' cannot be used in this field", make_str(macro_name)))?;
+                unreachable!();
+            },
+            b"label" => {
+                let _ = self.parse_tex_group(s)?; // Throw away the argument.
+                Ok(Node::empty())
+            }
+            _ => {
+                let mut args = Nodes::new();
+                while s.starts_with(b"{") { args.push(self.parse_tex_group(s)?); }
+                self.handle_unknown_macro(macro_name, args)
+            }
+        }
+    }
+
+    fn parse_tex_maths(&self, s: &mut Stream) -> Result<Node> {
+        assert!(s.consume(b"$"));
+        let node = Node::Math(make_str(s.take_until(b"$")).into()); // TODO: Support maths properly.
+        if !s.consume(b"$") { self.err("Expected '$'; if you meant to write a literal dollar sign, write '\\$'")? }
+        Ok(node)
+    }
+
+    fn parse_tex_single_arg_builtin_macro(&self, s: &mut Stream, m: BuiltinMacro) -> Result<Node> {
+        // Drop everything until the argument brace. We’re not a LaTeX tokeniser, so we don’t
+        // support stuff like `\fract1 2`, as much as I like to write it.
+        if !s.trim_start().starts_with(b"{") {
+            self.err("Sorry, macro arguments must be enclosed in braces")?;
+        }
+
+        let arg = self.parse_tex_group(s)?;
+        Ok(Node::builtin_with_args(m, vec![arg]))
+    }
+}
+
+impl<'s> Parser<'s> {
+    fn apply_string_replacement_op(s: &mut SmallCow, op: &StringReplacementOp, is_lemma: bool) {
+        use StringReplacementOp::*;
+        use SmallCow::*;
+        match op {
+            Lemma(ops) => {
+                if is_lemma {
+                    for op in ops {
+                        Self::apply_string_replacement_op(s, op, is_lemma);
+                    }
+                }
+            },
+            Lower => *s = Std(s.as_str().to_lowercase()),
+            Normalise(form) => *s = Small(form.apply(s.as_str())),
+            RemovePunct => *s = Small(s.as_str().chars().filter(|c| !c.is_mark() && !c.is_punctuation()).collect()),
+            Subst { regex, replacement } => {
+                let rep = regex.replace_all(s.as_str(), replacement.as_str());
+                if let Cow::Owned(o) = rep { *s = Std(o); }
+            }
+            Trie { trie, normalisation, replacements } => {
+                if let Some(n) = normalisation { *s = Small(n.apply(s.as_str())) }
+                *s = Std(trie.replace_all(s.as_str(), &replacements));
+            }
+        }
+    }
+
+    /// Check if we're looking at text.
+    fn at(&self, what: &[u8]) -> bool {
+        self.text.starts_with(what)
+    }
+
+    /// Helper to compile a user-provided regex.
+    fn compile_regex(&self, re: &[u8]) -> Result<Regex> {
+        let regex = make_str(re);
+        Regex::new(regex).map_err(|e| make_err(&self.context, &format!(
+            "Failed to compile regex '{}': {}",
+            regex,
+            e.to_string()
+        )))
+    }
+
     /// '\\ex' and friends are control macros that are really part of the dictionary
     /// syntax rather than markup; this function is used to disallow them in certain
     /// contexts.
-    fn disallow_specials(&self, text: &str, context: &str) -> Result<()> {
+    fn disallow_specials(&self, text: &[u8], context: &str) -> Result<()> {
+        let s = Stream::new(text);
         for special in [COMMENT_MACRO, EX_MACRO, SENSE_MACRO] {
-            if text.contains(special) {
-                return self.err(&format!("'{}' cannot be used in {}", special, context));
+            if s.find(special).is_some() {
+                return self.err(&format!(
+                    "'{}' cannot be used in {}",
+                    make_str(special),
+                    context
+                ));
             }
         }
 
         Ok(())
     }
 
+    /// Check if we're done parsing.
+    fn done(&self) -> bool { self.text.is_empty() }
+
+    /// Issue a parse error.
     fn err(&self, msg: &str) -> Result<()> {
-        Err(format!("Error near line {}: {}", self.line, msg))
+        Err(make_err(&self.context, msg))
     }
 
-    fn handle_user_err<T>(&self, e: Result<T>) -> Result<T> {
-        e.map_err(|e| self.err(&format!("{}", e)).unwrap_err())
+    /// Expect a string.
+    fn expect(&mut self, what: &[u8]) -> Result<()> {
+        if self.text.consume(what) { Ok(()) }
+        else { self.err(&format!("Expected '{}'", make_str(what))) }
     }
 
-    pub(crate) fn new(ops: Box<dyn LanguageOps>, opts: Options) -> Self {
-        Generator {
-            line: 0,
-            ops,
-            entries: vec![],
-            opts
+    /// Create a new parser.
+    fn new(g: &'s mut Generator, input: &'s str) -> Self {
+        Self {
+            context: ParserContext {
+                full_input_text: input.as_bytes(),
+                loc: 0,
+            },
+            text: Stream::new(input.as_bytes()),
+            g
         }
     }
 
-    fn normalise_for_search(&self, text: &str) -> String {
-        // NFKD; Latin-ASCII; [^a-z A-Z\\ ] Remove; Lower
-        let text: String = text
-            .nfkd()
-            .filter(|c| c.is_ascii_alphabetic() || *c == ' ')
-            .flat_map(|c| c.to_lowercase())
-            .collect();
+    /// Normalise a string for sorting.
+    fn normalise_for_sort(&self, text: &'s str) -> SmallCow<'s> {
+        match &self.g.collate {
+            None => panic!("Collation not initialised!"),
+            Some(coll) => {
+                let mut str = SmallCow::Borrowed(text);
 
-        // The steps below only apply to the haystack, not the needle, and should
-        // NOT be applied on the frontend:
+                // Apply preprocessing steps.
+                for op in &coll.ops { Self::apply_string_replacement_op(&mut str, op, false); }
+
+                // Delete everything not in 'by' if present,
+                if let Some(by) = &coll.by {
+                    str = SmallCow::Small(str
+                        .as_str()
+                        .chars()
+                        .filter(|c| by.contains(c))
+                        .collect()
+                    );
+                }
+
+                str
+            },
+        }
+    }
+
+    /// Parse the input.
+    fn parse(&mut self) -> Result<()> {
+        // Parse directives.
         //
-        // Yeet all instances of 'sbdsth', which is what 'sbd./sth.' degenerates to.
-        let text = text.replace("sbdsth", "");
-
-        // Unique all words and sort them.
-        let mut words: Vec<&str> = text.trim().split(" ").filter(|c|!c.is_empty()).collect();
-        words.sort();
-        words.dedup();
-        words.join(" ")
-    }
-
-    fn normalise_for_sort(&self, text: &str) -> String {
-        let text: String = text
-            .nfkd()
-            .filter(|c| !c.is_mark() && !c.is_punctuation())
-            .nfc()
-            .collect();
-
-        text.to_lowercase()
-    }
-
-    pub fn json(&mut self) -> String {
-        #[derive(Serialize)]
-        struct Json<'a> {
-            entries: &'a [Entry],
+        // Directives modify how entries are processed, so if a directive is defined after
+        // we've already seen some entries, it won't be applied to those; this is almost
+        // certainly not what you want.
+        while !self.skip_ws().done() && self.at(b"$") {
+            self.context.save_offset(self.text.text());
+            self.parse_directive()?;
         }
 
-        self.entries.sort_by(|a, b| self.ops.collate(
-            &a.word_for_sorting,
-            &b.word_for_sorting,
-            &a.nfkd,
-            &b.nfkd
-        ));
+        // Get the default collation if the user didn't define one.
+        if self.g.collate.is_none() { self.g.collate = Some(CollateDirective::make_default()); }
 
-        let j = Json { entries: &self.entries };
-        if !self.opts.pretty_json { serde_json::to_string(&j).unwrap() }
-        else {
-            let mut buf = Vec::new();
-            let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
-            let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
-            j.serialize(&mut ser).unwrap();
-            String::from_utf8(buf).unwrap()
+        // Parse entries.
+        while !self.skip_ws().done() {
+            self.context.save_offset(self.text.text());
+            if self.at(b"$") { self.err("Directives must precede all entries")?; }
+            self.parse_entry()?;
+        }
+
+        Ok(())
+    }
+
+    /// Parse a directive.
+    ///
+    /// ```ebnf
+    /// <directive> ::= <dir-ipa> | <dir-preprocess> | <dir-declare> | <dir-collate>
+    /// ```
+    fn parse_directive(&mut self) -> Result<()> {
+        assert!(self.text.starts_with(b"$"));
+        self.text.consume(b"$");
+        match self.text.take_until_any(b" \t\r\n{") {
+            b"collate" => self.parse_collate_directive(),
+            b"declare" => self.parse_declare_directive(),
+            b"ipa" => self.parse_ipa_directive(),
+            b"preprocess" => self.parse_preprocess_directive(),
+            dir => self.err(&format!("Unrecognised directive: '{}'", make_str(dir)))
         }
     }
 
-    pub fn parse(&mut self, input: &str) -> Result<()> {
-        self.line = 0;
-        let mut logical_line: Cow<'_, str> = Cow::Borrowed("");
-        for mut l in input.lines() {
-            self.line += 1;
+    /// Parse a collation directive.
+    ///
+    /// ```ebnf
+    /// <dir-collate> ::= "$collate" "{" { <clause> } "}"
+    /// <clause>      ::= <by> | <preprocess>
+    /// <by>          ::= "by" <string>
+    /// <preprocess>  ::= "preprocess" "{" { <string-replacement-op> } "}"
+    /// ```
+    fn parse_collate_directive(&mut self) -> Result<()> {
+        // Parse '{'.
+        self.skip_ws().expect(b"{")?;
 
-            // Drop comments.
-            match l.split_once('#') {
-                None => {},
-                Some((rest, _)) => l = rest,
+        // Parse clauses.
+        let mut by = None;
+        let mut ops = Vec::new();
+        while !self.skip_ws().done() && !self.at(b"}") {
+            match self.text.take_until_any(b" \t\r\n{") {
+                b"by" => {
+                    if by.is_some() { return self.err("Duplicate 'by' in $collate directive"); }
+                    self.skip_ws();
+                    self.expect(b"\"")?;
+                    by = Some(make_str(self.text.take_until_and_drop(b"\"")).chars().collect());
+                },
+                b"preprocess" => {
+                    // Parse '{'.
+                    self.skip_ws().expect(b"{")?;
+                    while !self.skip_ws().done() && !self.at(b"}") {
+                        let op = self.parse_string_replacement_op()?;
+                        ops.push(op);
+                    }
+
+                    // Parse '}'.
+                    self.skip_ws().expect(b"}")?;
+                },
+                dir => {
+                    return self.err(&format!("Unknown clause in $collate: {}", make_str(dir)));
+                }
+            }
+        }
+
+        // Parse '}'.
+        self.skip_ws().expect(b"}")?;
+
+        // Two collation directives don't really make sense.
+        if let Some(c) = &self.g.collate {
+            return self.err(&format!("A $collate directive was already given on line {}", c.line))
+        }
+
+        self.g.collate = Some(CollateDirective { by, ops, line: self.context.loc });
+        Ok(())
+    }
+
+
+    /// Parse a macro declaration directive.
+    ///
+    /// ```ebnf
+    /// <dir-declare> ::= "$declare" <name> <number> "\n"
+    /// ```
+    fn parse_declare_directive(&mut self) -> Result<()> {
+        let name: SmallStr = make_str(self.skip_ws().text.take_until_any(b" \t")).into();
+        let args = make_str(self.skip_ws().text.take_until_any(b" \t\r\n"));
+        let args = args.parse::<u32>().map_err(|e|
+            make_err(
+                &self.context,
+                &format!("Argument count '{}' is not a valid integer: {}", args, e.to_string())
+            )
+        )?;
+
+        if !self.text.take_until_any(b"\n#").trim_ascii().is_empty() {
+            self.err("Extraneous junk at the end of $declare directive")?;
+        }
+
+        self.skip_ws();
+        for m in &self.g.custom_macros {
+            if m.name == name {
+                self.err(&format!(
+                    "Custom macro '{}' was already declared on line {}",
+                    name,
+                    m.line
+                ))?;
+            }
+        }
+
+        self.g.custom_macros.push(CustomMacroDecl { name, args, line: self.context.loc });
+        Ok(())
+    }
+
+    /// Parse an ipa translation directive.
+    ///
+    /// ```ebnf
+    /// <dir-ipa> ::= "$ipa" "{" { <dir-ipa-op> } "}"
+    /// ```
+    fn parse_ipa_directive(&mut self) -> Result<()> {
+        // Parse '{'.
+        self.skip_ws().expect(b"{")?;
+
+        // Parse <op>s.
+        while !self.skip_ws().done() && !self.at(b"}") {
+            let op = self.parse_ipa_replacement_op()?;
+            self.g.ipa_converter.push(op);
+        }
+
+        // Parse '}'.
+        self.skip_ws().expect(b"}")?;
+        Ok(())
+    }
+
+    /// Parse an op that can appear in an '$ipa' directive.
+    ///
+    /// ```ebnf
+    /// <dir-ipa-op> ::= { <string-replacement-op> | <lemma-op> }
+    /// <lemma-op>   ::= "lemma" "{" { <dir-ipa-op> } "}"
+    /// ```
+    fn parse_ipa_replacement_op(&mut self) -> Result<StringReplacementOp> {
+        if self.text.consume(b"lemma") {
+            // Parse '{'.
+            self.skip_ws().expect(b"{")?;
+
+            // Parse ops recursively.
+            let mut ops = Vec::new();
+            while !self.skip_ws().done() && !self.at(b"}") {
+                let op = self.parse_ipa_replacement_op()?;
+                ops.push(op);
             }
 
-            // Skip empty lines.
+            // Parse '}'.
+            self.skip_ws().expect(b"}")?;
+            Ok(StringReplacementOp::Lemma(ops))
+        } else {
+            self.parse_string_replacement_op()
+        }
+    }
+
+    /// Parse a string replacement op.
+    ///
+    /// ```ebnf
+    /// <string-replacement-op> ::= "lower" | "nfd" | "nfc" | "nfkd" | "nfkc" | "remove_punct" | <trie> | <subst>
+    /// <subst>                 ::= "s" <delim> <chars> <delim> <chars> <delim>
+    /// ```
+    fn parse_string_replacement_op(&mut self) -> Result<StringReplacementOp> {
+        if self.text.starts_with(b"s") { return self.parse_regex_replacement(); }
+        Ok(match self.text.take_until_any(b" \t\r\n{(") {
+            b"lower" => StringReplacementOp::Lower,
+            b"nfc" => StringReplacementOp::Normalise(NormalisationForm::NFC),
+            b"nfd" => StringReplacementOp::Normalise(NormalisationForm::NFD),
+            b"nfkc" => StringReplacementOp::Normalise(NormalisationForm::NFKC),
+            b"nfkd" => StringReplacementOp::Normalise(NormalisationForm::NFKD),
+            b"remove_punct" => StringReplacementOp::RemovePunct,
+            b"trie" => self.parse_replacement_trie()?,
+            op => {
+                self.err(&format!("Unrecognised string op: '{}'", make_str(op)))?;
+                unreachable!();
+            }
+        })
+    }
+
+    /// Parse a regex replacement op.
+    fn parse_regex_replacement(&mut self) -> Result<StringReplacementOp> {
+        assert!(self.text.consume(b"s")); // Yeet 's'.
+        let delim = self.parse_re_delim()?;
+        let regex = self.text.take_until_and_drop(&[delim]);
+        let replacement = self.text.take_until_and_drop(&[delim]);
+        let replacement = self.process_unicode_escapes(replacement)?;
+        Ok(StringReplacementOp::Subst {
+            regex: self.compile_regex(regex)?,
+            replacement: SmallStr::from_str(make_str(replacement.as_ref())),
+        })
+    }
+
+    /// Parse a trie for replacement.
+    ///
+    /// ```ebnf
+    /// <trie>     ::= "trie" [ <norm> ] "{" { <pattern> } "}"
+    /// <pattern>  ::= <match> "=>" <word> "\n"
+    /// <norm>     ::= "(" ( "nfd" | "nfc" ) ")"
+    /// <match>    ::= <class> | <word> { "|" <word> }
+    /// <class>    ::= "[" { <char> | <unicode> } "]"
+    /// <word>     ::= { <char> | <unicode> }+
+    /// <unicode>  ::= "\x{" <hdigit> <hdigit> <hdigit> <hdigit> "}"
+    /// ```
+    fn parse_replacement_trie(&mut self) -> Result<StringReplacementOp> {
+        // Parse normalisation form.
+        let mut norm = None;
+        if self.skip_ws().text.consume(b"(") {
+            match self.skip_ws().text.take_until_any(b" \t\r\n)") {
+                b"nfd" => norm = Some(NormalisationForm::NFD),
+                b"nfc" => norm = Some(NormalisationForm::NFC),
+                b"nfkc" => norm = Some(NormalisationForm::NFKC),
+                b"nfkd" => norm = Some(NormalisationForm::NFKD),
+                opt => self.err(&format!("Invalid trie normalisation form: {}", make_str(opt)))?,
+            }
+            self.skip_ws().expect(b")")?;
+        }
+
+        // Parse '{'.
+        self.skip_ws().expect(b"{")?;
+
+        // Parse <pattern>s.
+        let mut patterns = Vec::<SmallStr>::new();
+        let mut replacements = Vec::<SmallStr>::new();
+        while !self.skip_ws().done() && !self.at(b"}") {
+            let mut n = 0;
+
+            // <class>
+            //
+            // We have individual bytes here, so we can't just append them to the
+            // patterns; instead collect them, and then below we split the bytes into
+            // chars.
+            if self.text.consume(b"[") {
+                let mut buffer = [0u8; 4];
+                let mut bytes = SmallVec::<[u8; 64]>::new();
+
+                // Collect individual bytes.
+                while !self.done() && !self.at(b"]") {
+                    if !self.at(b"\\") {
+                        bytes.push(self.text.take_byte().unwrap());
+                        continue;
+                    }
+
+                    // Handle escape sequences.
+                    self.text.drop_byte();
+                    if self.done() { self.err("Undelimited escape sequence in character class in '$ipa'")? }
+
+                    // Handle \x{...}.
+                    if self.at(b"x{") {
+                        let s = Stream::new(self.text.take_until_and_drop(b"}"));
+                        let seq = self.parse_unicode_escape_seq_after_backslash(s)?;
+                        bytes.extend(seq);
+                        continue;
+                    }
+
+                    // Handle other escape sequences.
+                    let c = match self.text.take_byte().unwrap() {
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        b'n' => b'\n',
+                        b'\\' => b'\\',
+                        b']' => b']',
+                        c => {
+                            self.err(&format!("Unrecognised escape sequence: '\\{}'", make_str(&[c])))?;
+                            unreachable!();
+                        }
+                    };
+
+                    bytes.push(c);
+                }
+
+                // Convert the bytes to characters and append each character.
+                for c in make_str(bytes.as_ref()).chars() {
+                    patterns.push(SmallStr::from_str(c.encode_utf8(&mut buffer)));
+                    n += 1;
+                }
+
+                // No skip_whitespace() here as whitespace is significant within '[]'.
+                self.expect(b"]")?;
+            }
+
+            // <word>
+            while {
+                let word = self.text.take_until_either(b"=>", b"|");
+                let word = self.process_unicode_escapes(word)?;
+                patterns.push(word);
+                n += 1;
+                self.text.consume(b"|")
+            } {}
+
+            // Parse '=>'
+            self.expect(b"=>")?;
+
+            // Get replacement text.
+            self.skip_ws();
+            let replacement = SmallStr::from_str(make_str(self.text.take_until_any(b" \t\r\n#")));
+            let mut replacement = self.process_unicode_escapes(replacement.as_bytes())?;
+            self.skip_ws();
+
+            // Normalise it; note also that a replacement of '*' means 'delete everything.
+            if replacement == "*" {
+                replacement.clear();
+            } else if let Some(n) = norm {
+                replacement = n.apply(&replacement);
+            }
+
+            // Append 'n' copies of it to match the number of patterns we parsed; also
+            // normalise the replacements if we parsed a normalisation form.
+            replacements.resize(replacements.len() + n, replacement);
+        }
+
+        // Parse '}'.
+        self.expect(b"}")?;
+
+        // Normalise all patterns.
+        if let Some(n) = norm {
+            for p in &mut patterns { *p = n.apply(p); }
+        }
+
+        Ok(StringReplacementOp::Trie {
+            replacements,
+            normalisation: norm,
+            trie: AhoCorasick::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .build(patterns)
+                .map_err(|e| make_err(
+                    &self.context,
+                    &format!("Failed to build trie: {}'", e.to_string())
+                ))?
+        })
+    }
+
+    /// Parse a unicode escape sequence.
+    fn parse_unicode_escape_seq_after_backslash(&self, mut seq: Stream) -> Result<SmallVec<[u8; 4]>> {
+        assert!(seq.consume(b"x{"));
+        let code = seq.take_until_and_drop(b"}");
+        if code.len() != 4 { self.err("Expected 4 hex digits in '\\x{...}'")? }
+
+        // Parse the number.
+        let num = u32::from_str_radix(make_str(code), 16)
+            .map_err(|e| make_err(
+                &self.context,
+                &format!("Invalid unicode codepoint '{}': {}", make_str(code), e.to_string())
+            )
+        )?;
+
+        // Convert it to a character.
+        let Some(c) = char::from_u32(num) else {
+            self.err(&format!("Invalid unicode codepoint '{}'", make_str(code)))?;
+            unreachable!();
+        };
+
+        // Append its bytes.
+        let mut buffer = [0u8; 4];
+        Ok(c.encode_utf8(&mut buffer).as_bytes().into())
+    }
+
+    /// Evaluate unicode escape sequences in a string.
+    fn process_unicode_escapes(&self, word: &[u8]) -> Result<SmallStr> {
+        let mut word = Stream::new(word);
+        if word.trim().contains_slice(b"\\x{") {
+            let mut processed = SmallStr::new();
+            while {
+                processed.push_str(make_str(word.take_until(b"\\")));
+                !word.is_empty()
+            } {
+                assert!(word.consume(b"\\"));
+                if word.starts_with(b"x{") {
+                    let s = Stream::new(word.take_until_and_drop(b"}"));
+                    let seq = self.parse_unicode_escape_seq_after_backslash(s)?;
+                    processed.push_str(make_str(seq.as_ref()));
+                } else {
+                    processed.push('\\');
+                }
+            }
+            Ok(processed)
+        } else {
+            Ok(make_str(word.text()).into())
+        }
+    }
+
+    /// Parse a directive that defines how fields should be preprocessed.
+    ///
+    /// ```ebnf
+    /// <dir-preprocess> ::= "$preprocess" "{" { <rule> } "}"
+    /// <rule>           ::= <field> "{" { <op> } "}"
+    /// <field>          ::= "pos" | "etym" | "def" | "forms" | "ipa"
+    /// <op>             ::= <match> | <string-replacement-op>
+    /// <match>          ::= [ "!" ] "m" <delim> <chars> <delim> [ <message> ]
+    /// <delim>          ::= "/" | "|"
+    /// ```
+    fn parse_preprocess_directive(&mut self) -> Result<()> {
+        // Parse '{'.
+        self.skip_ws().expect(b"{")?;
+
+        // Parse rules.
+        while !self.skip_ws().done() && !self.at(b"}") {
+            let field = match self.text.take_until_any(b" \t\r\n{") {
+                b"pos" => Part::POS,
+                b"etym" => Part::Etym,
+                b"def" => Part::Def,
+                b"forms" => Part::Forms,
+                b"ipa" => Part::IPA,
+                f => return self.err(&format!("Unrecognised field: '{}'", make_str(f)))
+            };
+
+            // Parse '{'.
+            self.skip_ws().expect(b"{")?;
+
+            // Parse ops.
+            while !self.skip_ws().done() && !self.at(b"}") {
+                // <match>
+                let op;
+                if self.at(b"!m") || self.at(b"m") {
+                    let negated = self.text.consume(b"!");
+                    self.text.drop_byte(); // Drop 'm'.
+
+                    // Parse regex.
+                    let delim = self.parse_re_delim()?;
+                    let regex = self.text.take_until_and_drop(&[delim]);
+                    self.skip_ws();
+
+                    // Parse optional message.
+                    let message = if !self.text.consume(b"\"") { None }
+                    else { Some(make_str(self.text.take_until_and_drop(&[b'"'])).to_string()) };
+                    op = PreprocessOp::Match {
+                        negated,
+                        message,
+                        regex: self.compile_regex(regex)?,
+                    }
+                } else {
+                    let str_op = self.parse_string_replacement_op()?;
+                    op = PreprocessOp::Replace(str_op)
+                }
+
+                self.g.preprocessor.push(PreprocessDirective { field, op })
+            }
+
+            // Parse '}'.
+            self.skip_ws().expect(b"}")?;
+        }
+
+        // Parse '}'.
+        self.skip_ws().expect(b"}")?;
+        Ok(())
+    }
+
+    /// Parse a regular expression delimiter.
+    fn parse_re_delim(&mut self) -> Result<u8> {
+        // We only support a limited set of delimiters.
+        if !self.text.starts_with_any(b"/|%") { self.err("Expected '|', '/', or '%' in regex")? }
+        Ok(self.text.take_byte().unwrap())
+    }
+
+    /// Parse an entry.
+    fn parse_entry(&mut self) -> Result<()> {
+        // Get the first line. We know that it's not empty because we call
+        // skip_whitespace() before we get here.
+        let mut line = Cow::Borrowed(self.take_line().unwrap());
+
+        // Add any following lines that are indented, ignoring empty lines.
+        while self.text.starts_with_any(b" \t\r\n") {
+            let l = self.take_line().unwrap();
             if l.is_empty() { continue }
-
-            // Check for directives.
-            if l.starts_with('$') { return self.err("Directives are no longer supported."); }
-
-            // Perform line continuation.
-            if l.starts_with(' ') || l.starts_with('\t') {
-                logical_line.to_mut().push(' ');
-                logical_line.to_mut().push_str(l.trim());
-                continue
-            }
-
-            // This line starts a new entry, so ship out the last
-            // one and start a new one.
-            self.parse_entry(&logical_line)?;
-
-            // Copying the line here may seem a little wasteful, but it turns out
-            // that a lot if not most entries span multiple lines, so it
-            logical_line = Cow::Borrowed(l);
+            line.to_mut().push(b' ');
+            line.to_mut().extend(l);
         }
 
-        // Make sure to also process the last line.
-        self.parse_entry(&logical_line)
-    }
-
-    fn parse_entry(&mut self, mut line: &str) -> Result<()> {
-        line = line.trim();
-
-        // Ignore empty lines here.
-        if line.is_empty() { return Ok(()) }
+        // Trim the input.
+        let line = Stream::new(line.as_ref().trim_ascii());
+        assert!(!line.is_empty());
 
         // If the line contains no '|' characters and a `>`,
         // it is a reference. Split by '>'. The lhs is a
         // comma-separated list of references, the rhs is the
         // actual definition.
-        if !line.contains('|') {
-            if !line.contains('>') { return self.err("An entry must contain at least one '|' or '>'") }
-            self.disallow_specials(line, "a reference entry")?;
+        if !line.contains(b'|') {
+            if !line.contains(b'>') { self.err("An entry must contain at least one '|' or '>'")? }
+            self.disallow_specials(line.text(), "a reference entry")?;
 
             // Split the line into lemma and references and parse the lemma.
-            let (words, target) = line.split_once('>').unwrap();
+            let (words, target) = line.split_once(b'>').unwrap();
             let target = self.parse_tex(target)?;
-            for word in words.split(',') {
-                let word = word.trim();
+            for word in Stream::new(words).split(b',') {
+                let word = word.trim_ascii();
                 if word.is_empty() { continue }
-                let nfkd = self.normalise_for_sort(word);
+                let collated = self.normalise_for_sort(make_str(word));
                 let word = self.parse_tex(word)?;
 
                 // Compute search string if requested.
                 let mut search = None;
                 let plain_word = word.render_plain_text(true);
-                if self.opts.populate_search_fields {
-                    search = Some(self.normalise_for_search(&plain_word));
+                if self.g.opts.populate_search_fields {
+                    search = Some(normalise_for_search(&plain_word));
                 }
 
-                self.entries.push(Entry {
+                self.g.entries.push(Entry {
                     word,
-                    word_for_sorting: plain_word,
-                    nfkd,
+                    plain_text_word: plain_word,
+                    collated_word: collated.into_small(),
                     data: RefEntry { r#ref: target.clone(), search }
                 });
             }
@@ -245,21 +1093,21 @@ impl Generator {
         // Otherwise, this is a regular entry.
         const MIN_PARTS: usize = Part::Def as usize;
         const MAX_PARTS: usize = Part::Max as usize;
-        let mut word: Option<&str> = None;
-        let mut parts = SmallVec::<[Cow<'_, str>; 5]>::new();
+        let mut word: Option<&[u8]> = None;
+        let mut parts = SmallVec::<[SmallCow; 5]>::new();
 
         // Split the line into fields.
-        for part in line.split('|') {
+        for part in line.split(b'|') {
             if word.is_none() {
                 self.disallow_specials(part, "the lemma")?;
-                word = Some(part.trim());
+                word = Some(part.trim_ascii());
             } else {
-                parts.push(Cow::Borrowed(part.trim()));
+                parts.push(SmallCow::Borrowed(make_str(part.trim_ascii())));
             }
         }
 
         // Preprocessing happens on raw strings before parsing.
-        self.handle_user_err(self.ops.preprocess_full_entry(&mut parts))?;
+        self.preprocess_full_entry(&mut parts)?;
 
         // Make sure we have enough parts as well as not too many parts.
         if parts.len() < MIN_PARTS {
@@ -271,13 +1119,12 @@ impl Generator {
         }
 
         // Part of speech.
-        let pos = self.parse_tex(&parts[Part::POS as usize])?;
+        let pos = self.parse_tex(parts[Part::POS as usize].as_bytes())?;
 
         // Etymology.
-
         let etym_str = &parts[Part::Etym as usize];
         let mut etym = None;
-        if !etym_str.is_empty() { etym = Some(self.parse_tex(etym_str)?) }
+        if !etym_str.as_str().is_empty() { etym = Some(self.parse_tex(etym_str.as_bytes())?) }
 
         // The primary definition is everything before the first sense and doesn’t
         // count as a sense because it is either the only one or, if there are multiple
@@ -285,11 +1132,12 @@ impl Generator {
         // senses.
         let mut primary_definition = None;
         let mut senses = SmallVec::<[Sense; 4]>::new();
-        match &parts[Part::Def as usize].split_once(SENSE_MACRO) {
-            None => { primary_definition = Some(self.split_sense(&parts[Part::Def as usize])?) },
-            Some((def, rest)) => {
-                if !def.trim().is_empty() { primary_definition = Some(self.split_sense(def)?); }
-                for sense in rest.split(SENSE_MACRO) { senses.push(self.split_sense(sense)?); }
+        let mut def = Stream::new(parts[Part::Def as usize].as_bytes());
+        if !def.trim().is_empty() {
+            let def_text = def.take_until_and_drop(SENSE_MACRO).trim_ascii();
+            if !def_text.is_empty() { primary_definition = Some(self.split_sense(def_text)?) }
+            while !def.trim_start().is_empty() {
+                senses.push(self.split_sense(def.take_until_and_drop(SENSE_MACRO))?);
             }
         }
 
@@ -297,26 +1145,26 @@ impl Generator {
         let mut forms = None;
         let mut ipa = None;
         if parts.len() > Part::Forms as usize {
-            forms = Some(self.parse_tex(&parts[Part::Forms as usize])?);
+            forms = Some(self.parse_tex(parts[Part::Forms as usize].as_bytes())?);
         }
 
         if parts.len() > Part::IPA as usize {
-            ipa = Some(self.parse_tex(&parts[Part::IPA as usize])?);
+            ipa = Some(self.parse_tex(parts[Part::IPA as usize].as_bytes())?);
         }
 
         // Create a canonicalised form of this entry for sorting.
         let word = word.unwrap();
-        let nfkd = self.normalise_for_sort(word);
+        let collated = self.normalise_for_sort(make_str(word));
         let word = self.parse_tex(word)?;
         let plain_word = word.render_plain_text(true);
 
         // If requested, also add search keys.
         let mut def_search = None;
         let mut hw_search = None;
-        if self.opts.populate_search_fields {
+        if self.g.opts.populate_search_fields {
             let mut def_search_str = match primary_definition {
                 Some(ref sense) => sense.def.render_plain_text(true),
-                None => String::new(),
+                None => SmallStr::new(),
             };
 
             for s in senses.iter() {
@@ -324,19 +1172,19 @@ impl Generator {
                 def_search_str.push_str(&s.def.render_plain_text(true));
             }
 
-            def_search = Some(self.normalise_for_search(&def_search_str));
-            hw_search = Some(self.normalise_for_search(&plain_word));
+            def_search = Some(normalise_for_search(&def_search_str));
+            hw_search = Some(normalise_for_search(&plain_word));
         }
 
         // If requested, generate IPA.
-        if ipa.is_none() && self.opts.always_include_ipa {
-            ipa = self.handle_user_err(self.ops.to_ipa(&plain_word))?;
+        if ipa.is_none() && self.g.opts.always_include_ipa {
+            ipa = self.to_ipa(&plain_word, true)?;
         }
 
-        self.entries.push(Entry {
+        self.g.entries.push(Entry {
             word,
-            word_for_sorting: plain_word,
-            nfkd,
+            plain_text_word: plain_word,
+            collated_word: collated.into_small(),
             data: FullEntry {
                 pos,
                 etym,
@@ -352,15 +1200,13 @@ impl Generator {
         Ok(())
     }
 
-    fn parse_tex(&self, tex: &str) -> Result<Node> {
-        let mut s = Stream::new(tex);
-        let mut nodes = Nodes::new();
-        s.trim();
-        while !s.is_empty() { self.parse_tex_content(&mut s, &mut nodes, 0)? }
-        Ok(Node::group(nodes))
+    /// Parse LaTeX.
+    fn parse_tex(&self, tex: &[u8]) -> Result<Node> {
+        TeXParser::parse_with_context(tex, &self.context, &self.g.custom_macros)
     }
 
-    fn parse_tex_and_add_full_stop(&self, tex: &str) -> Result<Node> {
+    /// Parse LaTeX and append a full stop.
+    fn parse_tex_and_add_full_stop(&self, tex: &[u8]) -> Result<Node> {
         // Recursively walk a node and append a full-stop to the end of
         // its last containing text node, if there is one, and if it doesn't
         // already end with a sentence delimiter (optionally followed by a
@@ -409,133 +1255,49 @@ impl Generator {
         Ok(node)
     }
 
-    fn parse_tex_content(&self, s: &mut Stream, nodes: &mut Nodes, mut braces: i32) -> Result<()> {
-        while !s.is_empty() {
-            // Append to an existing text node if possible and drop empty nodes.
-            fn push_node(nodes: &mut Nodes, n: Node) {
-                if let Node::Text(t) = n {
-                    if t.is_empty() { return }
-                    if !nodes.is_empty() && let Node::Text(prev) = nodes.last_mut().unwrap() {
-                        prev.push_str(&t);
-                        return
+    /// Preprocess a full entry.
+    fn preprocess_full_entry(&self, parts: &mut [SmallCow]) -> Result<()> {
+        for op in &self.g.preprocessor {
+            let idx = op.field as usize;
+            if idx >= parts.len() { continue }
+            let field = &mut parts[idx];
+            match &op.op {
+                PreprocessOp::Match { negated, regex, message } => {
+                    if regex.is_match(field.as_str()).unwrap_or(false) == *negated {
+                        let m = match message {
+                            Some(m) => &m,
+                            None => "Precondition failed"
+                        };
+
+                        self.err(m)?;
                     }
-                    nodes.push(Node::Text(t));
-                } else {
-                    nodes.push(n);
-                }
-            }
-
-            let text = s.take_until_any(&['\\', '$', '{', '}']);
-            push_node(nodes, Node::text(text));
-
-            // Process the special character.
-            match s.front().unwrap_or('\0') {
-                '\\' => push_node(nodes, self.parse_tex_macro(s)?),
-                '$' => push_node(nodes, self.parse_tex_maths(s)?),
-                '{' => {
-                    s.drop_byte();
-                    braces += 1;
                 },
-                '}' => {
-                    s.drop_byte();
-                    braces -= 1;
-                    if braces == 0 { return Ok(()) }
-                    if braces < 0 { return self.err("Too many '}'s!") }
+
+                PreprocessOp::Replace(op) => {
+                    Self::apply_string_replacement_op(field, op, false);
                 }
-                _ => break,
             }
         }
-
-        // If 'braces' is initially 0, it’s possible for us to get here without
-        // ever encountering a closing brace. This happens frequently if this
-        // function is invoked at the top-level of the parser.
-        if braces != 0 { self.err("Unexpected end of input. Did you forget a '}}'?") }
-        else { Ok(()) }
+        Ok(())
     }
 
-    fn parse_tex_group(&self, s: &mut Stream) -> Result<Node> {
-        assert!(s.consume("{"));
-        if s.consume("}") { return Ok(Node::empty()) }
-        let mut children = Nodes::new();
-        self.parse_tex_content(s, &mut children, 1)?;
-        Ok(Node::group(children))
+    /// Take the next line from the input and remove it. Whitespace as well as
+    /// comments are stripped.
+    fn take_line(&mut self) -> Option<&'s [u8]> {
+        let l = self.text.take_until_and_drop(b"\n");
+        let l = Stream::new(l).take_until(b"#");
+        Some(l.trim_ascii())
     }
 
-    fn parse_tex_macro(&self, s: &mut Stream) -> Result<Node> {
-        assert!(s.consume("\\"));
-        if s.is_empty() { self.err("Invalid macro escape sequence")? }
-
-        // Soft hyphen.
-        if s.consume("-") { return Ok(Node::builtin(BuiltinMacro::SoftHyphen)) }
-
-        // '\\' is invalid here.
-        if s.consume("\\") { self.err("'\\\\' cannot be used in this field")? }
-
-        // These are treated literally.
-        if s.text().starts_with(&[' ', '&', '$', '%', '#', '{', '}']) {
-            return Ok(Node::text(s.take_byte().unwrap()))
+    /// Skip whitespace and comments.
+    fn skip_ws(&mut self) -> &mut Self {
+        loop {
+            self.text.trim_start();
+            if !self.text.starts_with(b"#") { break; }
+            self.text.take_until_and_drop(b"\n");
         }
 
-        // These are unsupported single-character macros.
-        if s.text().starts_with(&['!', '/', ':', '@', '[', ']', '`', '{', '~']) {
-            return self.handle_user_err(
-                self.ops.handle_unknown_macro(&s.take_byte().unwrap().to_string(), vec![])
-            );
-        }
-
-        // Handle regular macros.
-        let idx = s.text().find(|c| !"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ@".contains(c));
-        let macro_name = match idx {
-            None => s.take_all(),
-            Some(idx) => s.take_until_idx(idx)
-        };
-
-        // Handle builtin macros.
-        match macro_name {
-            "s" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::SmallCaps),
-            "w" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Lemma),
-            "textit" | "i" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Italic),
-            "textbf" | "b" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Bold),
-            "textnf" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Normal),
-            "senseref" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Sense),
-            "Sup" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Superscript),
-            "Sub" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Subscript),
-            "ref" => self.parse_tex_single_arg_builtin_macro(s, BuiltinMacro::Reference),
-            "par" => Ok(Node::builtin(BuiltinMacro::ParagraphBreak)),
-            "ldots" => Ok(Node::builtin(BuiltinMacro::Ellipsis)),
-            "this" => Ok(Node::builtin(BuiltinMacro::This)),
-            "ex" | "comment" => {
-                self.err(&format!("'\\{}' cannot be used in this field", macro_name))?;
-                unreachable!();
-            },
-            "label" => {
-                let _ = self.parse_tex_group(s)?; // Throw away the argument.
-                Ok(Node::empty())
-            }
-            _ => {
-                let mut args = Nodes::new();
-                while s.starts_with("{") { args.push(self.parse_tex_group(s)?); }
-                self.handle_user_err(self.ops.handle_unknown_macro(macro_name, args))
-            }
-        }
-    }
-
-    fn parse_tex_maths(&self, s: &mut Stream) -> Result<Node> {
-        assert!(s.consume("$"));
-        let node = Node::Math(s.take_until("$").to_string()); // TODO: Support maths properly.
-        if !s.consume("$") { self.err("Expected '$'; if you meant to write a literal dollar sign, write '\\$'")? }
-        Ok(node)
-    }
-
-    fn parse_tex_single_arg_builtin_macro(&self, s: &mut Stream, m: BuiltinMacro) -> Result<Node> {
-        // Drop everything until the argument brace. We’re not a LaTeX tokeniser, so we don’t
-        // support stuff like `\fract1 2`, as much as I like to write it.
-        if !s.trim_start().starts_with("{") {
-            self.err("Sorry, macro arguments must be enclosed in braces")?;
-        }
-
-        let arg = self.parse_tex_group(s)?;
-        Ok(Node::builtin_with_args(m, vec![arg]))
+        self
     }
 
     /// Split a segment into definition, senses, and examples.
@@ -553,7 +1315,7 @@ impl Generator {
     ///     \ex example 2
     ///          \comment comment for example 2
     ///
-    fn split_sense(&self, sense: &str) -> Result<Sense> {
+    fn split_sense(&self, sense: &[u8]) -> Result<Sense> {
         let mut s = Stream::new(sense);
 
         // Find the sense comment or first example, if any, and depending on which comes first.
@@ -567,7 +1329,7 @@ impl Generator {
                 self.err("\\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead.")?
             }
 
-            let comment_str = s.take_until(EX_MACRO).trim();
+            let comment_str = s.take_until(EX_MACRO).trim_ascii();
             self.disallow_specials(comment_str, "a comment")?;
             comment = Some(self.parse_tex_and_add_full_stop(comment_str)?);
         }
@@ -582,7 +1344,7 @@ impl Generator {
             let text = s.trim_start().take_until_either(EX_MACRO, COMMENT_MACRO);
             let mut ex_comment = None;
             if s.consume(COMMENT_MACRO) {
-                let comment_str = s.take_until(EX_MACRO).trim();
+                let comment_str = s.take_until(EX_MACRO).trim_ascii();
                 self.disallow_specials(comment_str, "a comment")?;
                 ex_comment = Some(self.parse_tex_and_add_full_stop(comment_str)?);
             }
@@ -600,1298 +1362,89 @@ impl Generator {
 
         Ok(Sense { def, comment, examples })
     }
-}
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    struct TestOps;
-    struct TestOpsWithMacroHandler;
-    impl LanguageOps for TestOps {}
-    impl LanguageOps for TestOpsWithMacroHandler {
-        fn handle_unknown_macro(
-            &self,
-            macro_name: &str,
-            _args: Nodes,
-        ) -> Result<Node> {
-            match macro_name {
-                "/" => Ok(Node::text("Found /!")),
-                "foo" => Ok(Node::text("BAR")),
-                _ => Err(format!("Unknown macro '{}'", macro_name)),
-            }
-        }
-    }
-
-    #[test]
-    fn test_tex_parser() {
-        let t = Box::new(TestOps {});
-        let g = Generator::new(t, Default::default());
-
-        macro_rules! check {
-            ($in:literal, $out:literal) => {
-                assert_eq!(g.parse_tex($in).unwrap().render(), $out);
-            };
-        }
-
-        macro_rules! check_err {
-            ($in:literal, $out:literal) => {
-                assert_eq!(g.parse_tex($in).unwrap_err(), $out);
-            };
-        }
-
-        // Plain text.
-        check!("", "{\"text\":\"\"}");
-        check!("aa", "{\"text\":\"aa\"}");
-        check!("Sphinx of black quartz, judge my vows!", "{\"text\":\"Sphinx of black quartz, judge my vows!\"}");
-
-        // Braces are skipped.
-        check!("{}", "{\"text\":\"\"}");
-        check!("a{b}c", "{\"text\":\"abc\"}");
-        check!("{{a}}{b}{{c}}", "{\"text\":\"abc\"}");
-        check!("{{{{{{a}}{b}{{c}}}}}}", "{\"text\":\"abc\"}");
-
-        // Missing braces.
-        check_err!("{", "Error near line 0: Unexpected end of input. Did you forget a '}}'?");
-        check_err!("{{}", "Error near line 0: Unexpected end of input. Did you forget a '}}'?");
-        check_err!("}", "Error near line 0: Too many '}'s!");
-        check_err!("{}}", "Error near line 0: Too many '}'s!");
-        check_err!("{}{", "Error near line 0: Unexpected end of input. Did you forget a '}}'?");
-        check_err!("{}{}}", "Error near line 0: Too many '}'s!");
-
-        // Maths.
-        check!("$a$", "{\"math\":\"a\"}");
-
-        // Escaping braces.
-        check!("\\{", "{\"text\":\"{\"}");
-        check!("\\}", "{\"text\":\"}\"}");
-        check!("{\\{}", "{\"text\":\"{\"}");
-        check!("{\\}}", "{\"text\":\"}\"}");
-        check!("\\{{}", "{\"text\":\"{\"}");
-        check!("\\}{}", "{\"text\":\"}\"}");
-
-        // Single-character macros.
-        check!("\\-", "{\"macro\":{\"name\":\"soft_hyphen\"}}");
-        check!("\\ X", "{\"text\":\" X\"}"); // 'X' is required because we trim whitespace.
-        check!("\\&", "{\"text\":\"&\"}");
-        check!("\\$", "{\"text\":\"$\"}");
-        check!("\\%", "{\"text\":\"%\"}");
-        check!("\\#", "{\"text\":\"#\"}");
-        check!("{\\-}", "{\"macro\":{\"name\":\"soft_hyphen\"}}");
-        check!("{\\ }", "{\"text\":\" \"}");
-        check!("{\\&}", "{\"text\":\"&\"}");
-        check!("{\\$}", "{\"text\":\"$\"}");
-        check!("{\\%}", "{\"text\":\"%\"}");
-        check!("{\\#}", "{\"text\":\"#\"}");
-
-        // Unsupported single-character macros.
-        check_err!("\\@", "Error near line 0: Unsupported macro '\\@'. Please add support for it to the dictionary generator.");
-        check_err!("\\[", "Error near line 0: Unsupported macro '\\['. Please add support for it to the dictionary generator.");
-        check_err!("\\]", "Error near line 0: Unsupported macro '\\]'. Please add support for it to the dictionary generator.");
-
-        // Missing macro name.
-        check_err!("\\", "Error near line 0: Invalid macro escape sequence");
-
-        // Special macros aren't normally valid.
-        check_err!("\\\\", "Error near line 0: '\\\\' cannot be used in this field");
-        check_err!("\\ex", "Error near line 0: '\\ex' cannot be used in this field");
-        check_err!("\\comment", "Error near line 0: '\\comment' cannot be used in this field");
-
-        // Builtin single-argument macros.
-        check!("\\s{a}{b}", "{\"group\":[{\"macro\":{\"name\":\"small_caps\",\"args\":[{\"text\":\"a\"}]}},{\"text\":\"b\"}]}");
-        check!("\\s{a{c}}{b}", "{\"group\":[{\"macro\":{\"name\":\"small_caps\",\"args\":[{\"text\":\"ac\"}]}},{\"text\":\"b\"}]}");
-        check!("\\s{a{\\s{c}}}{b}", "{\"group\":[{\"macro\":{\"name\":\"small_caps\",\"args\":[{\"group\":[{\"text\":\"a\"},{\"macro\":{\"name\":\"small_caps\",\"args\":[{\"text\":\"c\"}]}}]}]}},{\"text\":\"b\"}]}");
-        check!("\\Sup{foo}bar", "{\"group\":[{\"macro\":{\"name\":\"superscript\",\"args\":[{\"text\":\"foo\"}]}},{\"text\":\"bar\"}]}");
-        check!("\\Sub{foo}bar", "{\"group\":[{\"macro\":{\"name\":\"subscript\",\"args\":[{\"text\":\"foo\"}]}},{\"text\":\"bar\"}]}");
-
-        // Builtin macros w/ no arguments.
-        check!("\\par", "{\"macro\":{\"name\":\"paragraph_break\"}}");
-        check!("\\ldots", "{\"macro\":{\"name\":\"ellipsis\"}}");
-        check!("\\this", "{\"macro\":{\"name\":\"this\"}}");
-
-        // Labels are dropped.
-        check!("x\\label{...abab{\\w{ss}}}y", "{\"text\":\"xy\"}");
-
-        // References are preserved.
-        check!("x\\ref{abab}y", "{\"group\":[{\"text\":\"x\"},{\"macro\":{\"name\":\"reference\",\"args\":[{\"text\":\"abab\"}]}},{\"text\":\"y\"}]}");
-    }
-
-    #[test]
-    fn test_macro_handler() {
-        let t = Box::new(TestOpsWithMacroHandler {});
-        let g = Generator::new(t, Default::default());
-
-        // Unknown macros are passed to the lang ops.
-        assert_eq!(g.parse_tex("\\/").unwrap().render(), "{\"text\":\"Found /!\"}");
-        assert_eq!(g.parse_tex("\\foo").unwrap().render(), "{\"text\":\"BAR\"}");
-    }
-
-    macro_rules! check_with_generator {
-        ($g:expr, $in: literal, $out: literal) => {
-            $g.parse($in).unwrap();
-
-            // Use json::parse() on both sides so we can format the expected JSON output
-            // in a way that is actually legible while still comparing the json without
-            // having to care about whitespace.
-            assert_eq!(
-                json::parse(&$g.json()).unwrap().to_string(),
-                json::parse($out).unwrap().to_string(),
-            );
-        };
-    }
-
-    #[test]
-    fn test_entry_parser() {
-        macro_rules! check {
-            ($in:literal, $out:literal) => {
-                {
-                    let t = Box::new(TestOps {});
-                    let mut g = Generator::new(t, Options { populate_search_fields: true, ..Default::default() });
-                    check_with_generator!(g, $in, $out);
-                }
-            };
-        }
-
-        check!("x|y|z|q", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "x"
-                        },
-                        "pos": {
-                            "text": "y"
-                        },
-                        "etym": {
-                            "text": "z"
-                        },
-                        "primary_definition": {
-                        "def": {
-                            "text": "q."
-                            }
-                        },
-                        "hw_search": "x",
-                        "def_search": "q"
-                    }
-                ]
-            }
-        "#);
-
-        check!("a&b|||c&d", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a&b"
-                        },
-                        "pos": {
-                            "text": ""
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "text": "c&d."
-                            }
-                        },
-                        "hw_search": "ab",
-                        "def_search": "cd"
-                    }
-                ]
-            }
-        "#);
-
-        check!("q|||mc d e g x y e mm ma mb mq", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "q"
-                        },
-                        "pos": {
-                            "text": ""
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "text": "mc d e g x y e mm ma mb mq."
-                            }
-                        },
-                        "hw_search": "q",
-                        "def_search": "d e g ma mb mc mm mq x y"
-                    }
-                ]
-            }
-        "#);
-
-        check!("aub’heír\\Sup{L}|v. (in)tr.|obéir|To obey (+\\s{part} sbd.)", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "group": [
-                                {
-                                    "text": "aub’heír"
-                                },
-                                {
-                                    "macro": {
-                                        "name": "superscript",
-                                        "args": [
-                                            {
-                                                "text": "L"
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        },
-                        "pos": {
-                            "text": "v. (in)tr."
-                        },
-                        "etym": {
-                            "text": "obéir"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "group": [
-                                    {
-                                        "text": "To obey (+"
-                                    },
-                                    {
-                                        "macro": {
-                                            "name": "small_caps",
-                                            "args": [
-                                                {
-                                                    "text": "part"
-                                                }
-                                            ]
-                                        }
-                                    },
-                                    {
-                                        "text": " sbd.)."
-                                    }
-                                ]
-                            }
-                        },
-                        "hw_search": "aubheir",
-                        "def_search": "obey sbd to"
-                    }
-                ]
-            }
-        "#);
-
-        check!("ánvé|v. tr.|animer|+\\s{acc} To bring to life, animate", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "ánvé"
-                        },
-                        "pos": {
-                            "text": "v. tr."
-                        },
-                        "etym": {
-                            "text": "animer"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "group": [
-                                    {
-                                        "text": "+"
-                                    },
-                                    {
-                                        "macro": {
-                                            "name": "small_caps",
-                                            "args": [
-                                                {
-                                                    "text": "acc"
-                                                }
-                                            ]
-                                        }
-                                    },
-                                    {
-                                        "text": " To bring to life, animate."
-                                    }
-                                ]
-                            }
-                        },
-                        "hw_search": "anve",
-                        "def_search": "animate bring life to"
-                    }
-                ]
-            }
-        "#);
-
-        check!("A|B|C|D\\\\ E\\comment F\\ex G\\comment H", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "A"
-                        },
-                        "pos": {
-                            "text": "B"
-                        },
-                        "etym": {
-                            "text": "C"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "text": "D."
-                            }
-                        },
-                        "senses": [
-                            {
-                                "def": {
-                                    "text": "E."
-                                },
-                                "comment": {
-                                    "text": "F."
-                                },
-                                "examples": [
-                                    {
-                                        "text": {
-                                            "text": "G."
-                                        },
-                                        "comment": {
-                                            "text": "H."
-                                        }
-                                    }
-                                ]
-                            }
-                        ],
-                        "hw_search": "a",
-                        "def_search": "d e"
-                    }
-                ]
-            }
-        "#);
-
-        check!("a|b|c|\\\\d", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "pos": {
-                            "text": "b"
-                        },
-                        "etym": {
-                            "text": "c"
-                        },
-                        "senses": [
-                            {
-                                "def": {
-                                    "text": "d."
-                                }
-                            }
-                        ],
-                        "hw_search": "a",
-                        "def_search": "d"
-                    }
-                ]
-            }
-        "#);
-
-        check!("a > b", r#"
-            {
-                "entries": [
-                    {
-                        "word": { "text": "a" },
-                        "ref": { "text": "b" },
-                        "search": "a"
-                    }
-                ]
-            }
-        "#);
-
-        check!("a, c ,d ,  b > e", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "ref": {
-                            "text": "e"
-                        },
-                        "search": "a"
-                    },
-                    {
-                        "word": {
-                            "text": "b"
-                        },
-                        "ref": {
-                            "text": "e"
-                        },
-                        "search": "b"
-                    },
-                    {
-                        "word": {
-                            "text": "c"
-                        },
-                        "ref": {
-                            "text": "e"
-                        },
-                        "search": "c"
-                    },
-                    {
-                        "word": {
-                            "text": "d"
-                        },
-                        "ref": {
-                            "text": "e"
-                        },
-                        "search": "d"
-                    }
-                ]
-            }
-        "#);
-
-        check!("ac’hes > \\w{a} + \\w{c’hes}", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "ac’hes"
-                        },
-                        "ref": {
-                            "group": [
-                                {
-                                    "macro": {
-                                        "name": "lemma",
-                                        "args": [
-                                            {
-                                                "text": "a"
-                                            }
-                                        ]
-                                    }
-                                },
-                                {
-                                    "text": " + "
-                                },
-                                {
-                                    "macro": {
-                                        "name": "lemma",
-                                        "args": [
-                                            {
-                                                "text": "c’hes"
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        },
-                        "search": "aches"
-                    }
-                ]
-            }
-        "#);
-
-        check!(
-            r#"vê₃|v.|même|
-                \\ To be the same, identical, alike
-                \\ \textit{(emphatic)} Oneself
-                    \comment Placed either directly after a noun or infixed after (the prefix part of) a pronoun.
-                    \ex \w{Aúłau vê ssèhá’z ivúb’hvâ} ‘Time itself stood still’
-                        \comment Lit. ‘Time itself ceased its movement’
-                    \ex \w{Jvêsyráré} ‘I saw it myself’
-                \\ \w{vêvâ} Even
-                    \comment In this sense, \w{vêvâ} usually precedes the noun (phrase) it qualifies.
-                    \ex \s{H. P. Lovecraft:} \w{Lavúrer’sý’ýâ là dwájávé sdaúr~/ Ádȅr trâ vêvâ Dérny’éhuf laúv’raú.}
-                        ‘That is not dead which can eternal lie~/ And with strange æons even death may die’."#,
-            r#"
-                {
-                    "entries": [
-                        {
-                            "word": {
-                                "text": "vê₃"
-                            },
-                            "pos": {
-                                "text": "v."
-                            },
-                            "etym": {
-                                "text": "même"
-                            },
-                            "senses": [
-                                {
-                                    "def": {
-                                        "text": "To be the same, identical, alike."
-                                    }
-                                },
-                                {
-                                    "def": {
-                                        "group": [
-                                            {
-                                                "macro": {
-                                                    "name": "italic",
-                                                    "args": [
-                                                        {
-                                                            "text": "(emphatic)"
-                                                        }
-                                                    ]
-                                                }
-                                            },
-                                            {
-                                                "text": " Oneself."
-                                            }
-                                        ]
-                                    },
-                                    "comment": {
-                                        "text": "Placed either directly after a noun or infixed after (the prefix part of) a pronoun."
-                                    },
-                                    "examples": [
-                                        {
-                                            "text": {
-                                                "group": [
-                                                    {
-                                                        "macro": {
-                                                            "name": "lemma",
-                                                            "args": [
-                                                                {
-                                                                    "text": "Aúłau vê ssèhá’z ivúb’hvâ"
-                                                                }
-                                                            ]
-                                                        }
-                                                    },
-                                                    {
-                                                        "text": " ‘Time itself stood still’."
-                                                    }
-                                                ]
-                                            },
-                                            "comment": {
-                                                "text": "Lit. ‘Time itself ceased its movement’."
-                                            }
-                                        },
-                                        {
-                                            "text": {
-                                                "group": [
-                                                    {
-                                                        "macro": {
-                                                            "name": "lemma",
-                                                            "args": [
-                                                                {
-                                                                    "text": "Jvêsyráré"
-                                                                }
-                                                            ]
-                                                        }
-                                                    },
-                                                    {
-                                                        "text": " ‘I saw it myself’."
-                                                    }
-                                                ]
-                                            }
-                                        }
-                                    ]
-                                },
-                                {
-                                    "def": {
-                                        "group": [
-                                            {
-                                                "macro": {
-                                                    "name": "lemma",
-                                                    "args": [
-                                                        {
-                                                            "text": "vêvâ"
-                                                        }
-                                                    ]
-                                                }
-                                            },
-                                            {
-                                                "text": " Even."
-                                            }
-                                        ]
-                                    },
-                                    "comment": {
-                                        "group": [
-                                            {
-                                                "text": "In this sense, "
-                                            },
-                                            {
-                                                "macro": {
-                                                    "name": "lemma",
-                                                    "args": [
-                                                        {
-                                                            "text": "vêvâ"
-                                                        }
-                                                    ]
-                                                }
-                                            },
-                                            {
-                                                "text": " usually precedes the noun (phrase) it qualifies."
-                                            }
-                                        ]
-                                    },
-                                    "examples": [
-                                        {
-                                            "text": {
-                                                "group": [
-                                                    {
-                                                        "macro": {
-                                                            "name": "small_caps",
-                                                            "args": [
-                                                                {
-                                                                    "text": "H. P. Lovecraft:"
-                                                                }
-                                                            ]
-                                                        }
-                                                    },
-                                                    {
-                                                        "text": " "
-                                                    },
-                                                    {
-                                                        "macro": {
-                                                            "name": "lemma",
-                                                            "args": [
-                                                                {
-                                                                    "text": "Lavúrer’sý’ýâ là dwájávé sdaúr~/ Ádȅr trâ vêvâ Dérny’éhuf laúv’raú."
-                                                                }
-                                                            ]
-                                                        }
-                                                    },
-                                                    {
-                                                        "text": " ‘That is not dead which can eternal lie~/ And with strange æons even death may die’."
-                                                    }
-                                                ]
-                                            }
-                                        }
-                                    ]
-                                }
-                            ],
-                            "hw_search": "ve",
-                            "def_search": "alike be even identical oneself same the to"
-                        }
-                    ]
-                }
-            "#
-        );
-
-        check!("Z|b|c|d\nX>Y\nY|e|f|g", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "X"
-                        },
-                        "ref": {
-                            "text": "Y"
-                        },
-                        "search": "x"
-                    },
-                    {
-                        "word": {
-                            "text": "Y"
-                        },
-                        "pos": {
-                            "text": "e"
-                        },
-                        "etym": {
-                            "text": "f"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "text": "g."
-                            }
-                        },
-                        "hw_search": "y",
-                        "def_search": "g"
-                    },
-                    {
-                        "word": {
-                            "text": "Z"
-                        },
-                        "pos": {
-                            "text": "b"
-                        },
-                        "etym": {
-                            "text": "c"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "text": "d."
-                            }
-                        },
-                        "hw_search": "z",
-                        "def_search": "d"
-                    }
-                ]
-            }
-
-        "#);
-
-        check!("a , > b", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "ref": {
-                            "text": "b"
-                        },
-                        "search": "a"
-                    }
-                ]
-            }
-        "#);
-
-        check!("ad’hór|v. tr. or n.|adore|love\nvy’í, aúsó > eḍ", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "ad’hór"
-                        },
-                        "pos": {
-                            "text": "v. tr. or n."
-                        },
-                        "etym": {
-                            "text": "adore"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "text": "love."
-                            }
-                        },
-                        "hw_search": "adhor",
-                        "def_search": "love"
-                    },
-                    {
-                        "word": {
-                            "text": "aúsó"
-                        },
-                        "ref": {
-                            "text": "eḍ"
-                        },
-                        "search": "auso"
-                    },
-                    {
-                        "word": {
-                            "text": "vy’í"
-                        },
-                        "ref": {
-                            "text": "eḍ"
-                        },
-                        "search": "vyi"
-                    }
-                ]
-            }
-        "#);
-
-        check!(" b|x|x|x\na|y|y|y", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "pos": {
-                            "text": "y"
-                        },
-                        "etym": {
-                            "text": "y"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "text": "y."
-                            }
-                        },
-                        "hw_search": "a",
-                        "def_search": "y"
-                    },
-                    {
-                        "word": {
-                            "text": "b"
-                        },
-                        "pos": {
-                            "text": "x"
-                        },
-                        "etym": {
-                            "text": "x"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "text": "x."
-                            }
-                        },
-                        "hw_search": "b",
-                        "def_search": "x"
-                    }
-                ]
-            }
-        "#);
-
-        // Test that full-stop insertion works properly in the presence of macros with no
-        // arguments or \ref.
-        check!("a|b|c|foo \\ref{bar}", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "pos": {
-                            "text": "b"
-                        },
-                        "etym": {
-                            "text": "c"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "group": [
-                                    {
-                                        "text": "foo "
-                                    },
-                                    {
-                                        "macro": {
-                                            "name": "reference",
-                                            "args": [
-                                                {
-                                                    "text": "bar"
-                                                }
-                                            ]
-                                        }
-                                    },
-                                    {
-                                        "text": "."
-                                    }
-                                ]
-                            }
-                        },
-                        "hw_search": "a",
-                        "def_search": "foo"
-                    }
-                ]
-            }
-        "#);
-
-        check!("a|b|c|foo \\ref{bar}.", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "pos": {
-                            "text": "b"
-                        },
-                        "etym": {
-                            "text": "c"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "group": [
-                                    {
-                                        "text": "foo "
-                                    },
-                                    {
-                                        "macro": {
-                                            "name": "reference",
-                                            "args": [
-                                                {
-                                                    "text": "bar"
-                                                }
-                                            ]
-                                        }
-                                    },
-                                    {
-                                        "text": "."
-                                    }
-                                ]
-                            }
-                        },
-                        "hw_search": "a",
-                        "def_search": "foo"
-                    }
-                ]
-            }
-        "#);
-
-        check!("a|b|c|foo \\ref{bar.}.", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "pos": {
-                            "text": "b"
-                        },
-                        "etym": {
-                            "text": "c"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "group": [
-                                    {
-                                        "text": "foo "
-                                    },
-                                    {
-                                        "macro": {
-                                            "name": "reference",
-                                            "args": [
-                                                {
-                                                    "text": "bar."
-                                                }
-                                            ]
-                                        }
-                                    },
-                                    {
-                                        "text": "."
-                                    }
-                                ]
-                            }
-                        },
-                        "hw_search": "a",
-                        "def_search": "foo"
-                    }
-                ]
-            }
-        "#);
-
-        check!("a|b|c|foo \\this", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "pos": {
-                            "text": "b"
-                        },
-                        "etym": {
-                            "text": "c"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "group": [
-                                    {
-                                        "text": "foo "
-                                    },
-                                    {
-                                        "macro": {
-                                            "name": "this"
-                                        }
-                                    },
-                                    {
-                                        "text": "."
-                                    }
-                                ]
-                            }
-                        },
-                        "hw_search": "a",
-                        "def_search": "foo"
-                    }
-                ]
-            }
-        "#);
-
-        check!("a|b|c|foo \\this.", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "pos": {
-                            "text": "b"
-                        },
-                        "etym": {
-                            "text": "c"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "group": [
-                                    {
-                                        "text": "foo "
-                                    },
-                                    {
-                                        "macro": {
-                                            "name": "this"
-                                        }
-                                    },
-                                    {
-                                        "text": "."
-                                    }
-                                ]
-                            }
-                        },
-                        "hw_search": "a",
-                        "def_search": "foo"
-                    }
-                ]
-            }
-        "#);
-
-        check!("a|b|c|foo\\ldots", r#"
-            {
-                "entries": [
-                    {
-                        "word": {
-                            "text": "a"
-                        },
-                        "pos": {
-                            "text": "b"
-                        },
-                        "etym": {
-                            "text": "c"
-                        },
-                        "primary_definition": {
-                            "def": {
-                                "group": [
-                                    {
-                                        "text": "foo"
-                                    },
-                                    {
-                                        "macro": {
-                                            "name": "ellipsis"
-                                        }
-                                    }
-                                ]
-                            }
-                        },
-                        "hw_search": "a",
-                        "def_search": "foo"
-                    }
-                ]
-            }
-        "#);
-    }
-
-    #[test]
-    fn test_entry_parser_errors() {
-        let t = Box::new(TestOps {});
-        let mut g = Generator::new(t, Default::default());
-
-        macro_rules! check_err {
-            ($in:literal, $out:literal) => {
-                assert_eq!(g.parse($in).unwrap_err(), $out);
-            };
-        }
-
-        check_err!(
-            "x|y|z|\\comment abcd",
-            "Error near line 1: \\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead."
-        );
-
-        check_err!(
-            "x|y|z|\\\\\\comment abcd",
-            "Error near line 1: \\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead."
-        );
-
-        check_err!(
-            "x|y|z|\\ex abcd",
-            "Error near line 1: \\ex is not allowed in an empty sense or empty primary definition."
-        );
-
-        check_err!(
-            "x|y|z|\\\\\\ex abcd",
-            "Error near line 1: \\ex is not allowed in an empty sense or empty primary definition."
-        );
-
-        check_err!(
-            "\\\\a|||",
-            "Error near line 1: '\\\\' cannot be used in the lemma"
-        );
-
-        check_err!(
-            "\\comment|||",
-            "Error near line 1: '\\comment' cannot be used in the lemma"
-        );
-
-        check_err!(
-            "\\ex|||",
-            "Error near line 1: '\\ex' cannot be used in the lemma"
-        );
-
-        check_err!(
-            "foo",
-            "Error near line 1: An entry must contain at least one '|' or '>'"
-        );
-
-        check_err!(
-            "\\comment > b",
-            "Error near line 1: '\\comment' cannot be used in a reference entry"
-        );
-
-        check_err!(
-            "a > \\comment",
-            "Error near line 1: '\\comment' cannot be used in a reference entry"
-        );
-
-        check_err!(
-            "\\ex > b",
-            "Error near line 1: '\\ex' cannot be used in a reference entry"
-        );
-
-        check_err!(
-            "a > \\ex",
-            "Error near line 1: '\\ex' cannot be used in a reference entry"
-        );
-
-        check_err!(
-            "\\\\ > b",
-            "Error near line 1: '\\\\' cannot be used in a reference entry"
-        );
-
-        check_err!(
-            "a > \\\\",
-            "Error near line 1: '\\\\' cannot be used in a reference entry"
-        );
-
-        check_err!(
-            "a|b|c|d \\comment abc \\comment abc",
-            "Error near line 1: '\\comment' cannot be used in a comment"
-        );
-
-        check_err!("a\\comment|b|c|d", "Error near line 1: '\\comment' cannot be used in the lemma");
-        check_err!("a\\ex|b|c|d", "Error near line 1: '\\ex' cannot be used in the lemma");
-        check_err!("a\\\\|b|c|d", "Error near line 1: '\\\\' cannot be used in the lemma");
-
-        check_err!("a|b\\comment|c|d", "Error near line 1: '\\comment' cannot be used in this field");
-        check_err!("a|b\\ex|c|d", "Error near line 1: '\\ex' cannot be used in this field");
-        check_err!("a|b\\\\|c|d", "Error near line 1: '\\\\' cannot be used in this field");
-
-        check_err!("a|b|c\\comment|d", "Error near line 1: '\\comment' cannot be used in this field");
-        check_err!("a|b|c\\ex|d", "Error near line 1: '\\ex' cannot be used in this field");
-        check_err!("a|b|c\\\\|d", "Error near line 1: '\\\\' cannot be used in this field");
-
-        check_err!("a|b|c|d|\\comment", "Error near line 1: '\\comment' cannot be used in this field");
-        check_err!("a|b|c|d|\\ex", "Error near line 1: '\\ex' cannot be used in this field");
-        check_err!("a|b|c|d|\\\\", "Error near line 1: '\\\\' cannot be used in this field");
-
-        check_err!("a > b \\comment", "Error near line 1: '\\comment' cannot be used in a reference entry");
-        check_err!("a > b \\ex", "Error near line 1: '\\ex' cannot be used in a reference entry");
-        check_err!("a > b \\\\", "Error near line 1: '\\\\' cannot be used in a reference entry");
-
-        check_err!("a\\comment > b", "Error near line 1: '\\comment' cannot be used in a reference entry");
-        check_err!("a\\ex > b", "Error near line 1: '\\ex' cannot be used in a reference entry");
-        check_err!("a\\\\ > b", "Error near line 1: '\\\\' cannot be used in a reference entry");
-    }
-
-    #[test]
-    fn test_always_generate_ipa() {
-        struct IPAOps;
-        impl LanguageOps for IPAOps {
-            fn to_ipa(&self, w: &str) -> Result<Option<Node>> {
-                Ok(Some(Node::text(format!("/{w}:{w}/"))))
-            }
-        }
-
-        let t = Box::new(IPAOps {});
-        let mut g = Generator::new(t, Options { always_include_ipa: true, ..Default::default() });
-        check_with_generator!(g, "a|b|c|d", r#" {
-            "entries": [
-                {
-                    "word": {
-                        "text": "a"
-                    },
-                    "pos": {
-                        "text": "b"
-                    },
-                    "etym": {
-                        "text": "c"
-                    },
-                    "ipa": {
-                        "text": "/a:a/"
-                    },
-                    "primary_definition": {
-                        "def": {
-                            "text": "d."
-                        }
-                    }
-                }
-            ]
-        }"#);
-    }
-
-    #[test]
-    fn test_custom_macro() {
-        struct Ops;
-        impl LanguageOps for Ops {
-            fn handle_unknown_macro(&self, macro_name: &str, args: Nodes) -> Result<Node> {
-                Ok(Node::custom(macro_name.to_string(), args))
-            }
-        }
-
-        let t = Box::new(Ops {});
-        let mut g = Generator::new(t, Default::default());
-        check_with_generator!(g, "a|b|c|\\foo{bar}{quux}\\baz\\bar{xyz}\\baz", r#" {
-            "entries": [
-                {
-                    "word": {
-                        "text": "a"
-                    },
-                    "pos": {
-                        "text": "b"
-                    },
-                    "etym": {
-                        "text": "c"
-                    },
-                    "primary_definition": {
-                        "def": {
-                            "group": [
-                                {
-                                    "custom_macro": {
-                                        "name": "foo",
-                                        "args": [
-                                            {
-                                                "text": "bar"
-                                            },
-                                            {
-                                                "text": "quux"
-                                            }
-                                        ]
-                                    }
-                                },
-                                {
-                                    "custom_macro": {
-                                        "name": "baz"
-                                    }
-                                },
-                                {
-                                    "custom_macro": {
-                                        "name": "bar",
-                                        "args": [
-                                            {
-                                                "text": "xyz"
-                                            }
-                                        ]
-                                    }
-                                },
-                                {
-                                    "custom_macro": {
-                                        "name": "baz"
-                                    }
-                                },
-                                {
-                                    "text": "."
-                                }
-                            ]
-                        }
-                    }
-                }
-            ]
-        }"#);
-    }
-
-    // Test that preprocess_full_entry() includes a source location.
-    #[test]
-    fn test_preprocess_full_entry() {
-        struct Ops {}
-        impl LanguageOps for Ops {
-            fn preprocess_full_entry(&self, _entry: &mut [Cow<'_, str>]) -> Result<()> {
-                Err("foobar".to_string())
-            }
-        }
-
-        let t = Box::new(Ops {});
-        let mut g = Generator::new(t, Default::default());
-
-        macro_rules! check_err {
-            ($in:literal, $out:literal) => {
-                assert_eq!(g.parse($in).unwrap_err(), $out);
-            };
-        }
-
-        check_err!("a|b|c|d", "Error near line 1: foobar");
+    fn to_ipa(&self, word: &str, is_lemma: bool) -> Result<Option<Node>> {
+        let Some(word) = self.g.to_unparsed_ipa_string(word, is_lemma) else { return Ok(None) };
+        self.parse_tex(word.as_str().as_bytes()).map(Some)
     }
 }
+
+impl Generator {
+    fn collate(&self, a: &Entry, b: &Entry) -> Ordering  {
+        // If we have a collation, use it.
+        if let Some(coll) = &self.collate && let Some(by) = &coll.by {
+            for (c1, c2) in a.collated_word.chars().zip(b.collated_word.chars()) {
+                // We remove any characters not in 'by', so the find here should
+                // never fail.
+                let f1 = by.iter().position(|&c| c == c1).unwrap();
+                let f2 = by.iter().position(|&c| c == c2).unwrap();
+                if f1 != f2 { return f1.cmp(&f2) }
+            }
+
+            // Both collated words have a common prefix; put the shorter one first. If both
+            // simplified strings have the same length, also compare the original strings.
+            let cmp = a.collated_word.len().cmp(&b.collated_word.len());
+            if cmp != Ordering::Equal { cmp }
+            else { a.plain_text_word.len().cmp(&b.plain_text_word.len()) }
+        }
+
+        // Otherwise, just do regular lexicographical string comparison.
+        else {
+            let cmp = a.collated_word.cmp(&b.collated_word);
+            if cmp != Ordering::Equal { cmp }
+            else { a.plain_text_word.cmp(&b.plain_text_word) }
+        }
+    }
+
+    pub fn new(opts: Options) -> Self {
+        Generator { opts, ..Self::default() }
+    }
+
+    pub fn json(&self) -> String {
+        #[derive(Serialize)]
+        struct Json<'a> {
+            entries: &'a [Entry],
+        }
+
+        let j = Json { entries: &self.entries };
+        if !self.opts.pretty_json { serde_json::to_string(&j).unwrap() }
+        else {
+            let mut buf = Vec::new();
+            let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+            j.serialize(&mut ser).unwrap();
+            String::from_utf8(buf).unwrap()
+        }
+    }
+
+    pub fn parse(&mut self, input: &str) -> Result<()> {
+        let mut p = Parser::new(self, input);
+        p.parse()?;
+        self.sort_entries();
+        Ok(())
+    }
+
+    fn sort_entries(&mut self) {
+        // Hack because 'collate()' borrows self: move out of the
+        // member, sort, and then move back in.
+        let mut moved = Vec::new();
+        std::mem::swap(&mut self.entries, &mut moved);
+        moved.sort_by(|a, b| self.collate(a, b));
+        self.entries = moved;
+    }
+
+    #[allow(unused)] // Function used by the WASM bindings.
+    pub fn to_ipa(&self, word: &str) -> Result<Option<Node>> {
+        let Some(word) = self.to_unparsed_ipa_string(word, false) else { return Ok(None) };
+        TeXParser::parse(word.as_bytes(), &self.custom_macros).map(Some)
+    }
+
+    fn to_unparsed_ipa_string(&self, word: &str, is_lemma: bool) -> Option<SmallStr> {
+        if self.ipa_converter.is_empty() { return None }
+        let mut word = SmallCow::Borrowed(word);
+        for op in &self.ipa_converter { Parser::apply_string_replacement_op(&mut word, op, is_lemma); }
+        Some(word.into_small())
+    }
+}
+
+include!("../test/test.rs");
