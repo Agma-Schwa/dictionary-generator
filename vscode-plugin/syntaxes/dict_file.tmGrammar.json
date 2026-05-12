@@ -53,8 +53,7 @@
                 { "include": "#directive_string_simple" },
                 { "include": "#directive_string_trie" },
                 { "include": "#directive_string_subst" },
-                { "include": "#comment" },
-                { "include": "#directive_ipa_lemma" }
+                { "include": "#comment" }
             ]
         },
         "directive_preprocess": {

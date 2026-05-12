@@ -3,6 +3,7 @@ use serde::Serialize;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use fancy_regex::Regex;
 use unicode_categories::UnicodeCategories;
 use unicode_normalization::UnicodeNormalization;
@@ -77,8 +78,8 @@ pub struct Generator {
     collate: Option<CollateDirective>
 }
 
-// Source location info for a parser.
-struct ParserContext<'s> {
+/// Base type that holds common data and functionality for both the TeX and main parser.
+struct ParserBase<'s> {
     /// The entire input we're parsing. We don't use 'str' since we want to
     /// be able to index into it.
     full_input_text: &'s [u8],
@@ -92,7 +93,7 @@ struct ParserContext<'s> {
 }
 
 struct Parser<'s> {
-    context: ParserContext<'s>,
+    base: ParserBase<'s>,
 
     /// The text that we still need to parse.
     text: Stream<'s>,
@@ -102,7 +103,7 @@ struct Parser<'s> {
 }
 
 struct TeXParser<'a> {
-    context: &'a ParserContext<'a>,
+    base: &'a ParserBase<'a>,
     custom_macros: &'a [CustomMacroDecl],
 }
 
@@ -262,21 +263,43 @@ fn make_str(s: &[u8]) -> &str {
     }
 }
 
-fn make_err(c: &ParserContext, msg: &str) -> String {
-    let line = 1 + Stream::new(&c.full_input_text[..(c.loc as usize)]).count(b'\n');
-    format!("Error near line {}: {}", line, msg)
-}
+impl<'a> ParserBase<'a> {
+    fn make_err(&self, msg: &str) -> String {
+        let line = 1 + Stream::new(&self.full_input_text[..(self.loc as usize)]).count(b'\n');
+        format!("Error near line {}: {}", line, msg)
+    }
 
-impl<'a> ParserContext<'a> {
+    /// Parse a unicode escape sequence.
+    fn parse_unicode_escape_seq(&self, seq: &mut Stream) -> Result<SmallVec<[u8; 4]>> {
+        if !seq.consume(b"{") { return Err(self.make_err("Expected '{' after '\\x'")); }
+        let code = seq.take_until(b"}");
+        if !seq.consume(b"}") { return Err(self.make_err("Missing '}' in Unicode escape sequence")); }
+        if code.len() == 0 { return Err(self.make_err("Expected at least 1 digit in '\\x{...}'")) }
+
+        // Parse the number.
+        let num = u32::from_str_radix(make_str(code), 16)
+            .map_err(|_| self.make_err(
+                &format!("Invalid unicode codepoint '{}'", make_str(code))
+            )
+        )?;
+
+        // Convert it to a character.
+        let Some(c) = char::from_u32(num) else {
+            return Err(self.make_err(&format!("Invalid unicode codepoint '{}'", make_str(code))));
+        };
+
+        // Append its bytes.
+        let mut buffer = [0u8; 4];
+        Ok(c.encode_utf8(&mut buffer).as_bytes().into())
+    }
+
     fn save_offset(&mut self, text: &[u8]) {
         self.loc = self.full_input_text.element_offset(&text[0]).unwrap() as u32
     }
 }
 
 impl<'a> TeXParser<'a> {
-    fn err(&self, msg: &str) -> Result<()> {
-        Err(make_err(&self.context, msg))
-    }
+    fn err(&self, msg: &str) -> Result<()> { Err(self.base.make_err(msg)) }
 
     /// Handle an unknown macro.
     fn handle_unknown_macro(
@@ -302,7 +325,7 @@ impl<'a> TeXParser<'a> {
         }
 
         let name = make_str(macro_name);
-        Err(make_err(&self.context, &format!(
+        Err(self.base.make_err(&format!(
             "Unknown macro '\\{}'; did you forget to '$declare {} {}' somewhere?",
             name,
             name,
@@ -312,16 +335,16 @@ impl<'a> TeXParser<'a> {
 
     #[allow(unused)] // Function used by the WASM bindings.
     pub fn parse(tex: &[u8], custom_macros: &[CustomMacroDecl]) -> Result<Node> {
-        let ctx = ParserContext { full_input_text: tex, loc: 0 };
+        let ctx = ParserBase { full_input_text: tex, loc: 0 };
         Self::parse_with_context(tex, &ctx, custom_macros)
     }
 
     fn parse_with_context(
         tex: &[u8],
-        context: &ParserContext,
+        context: &ParserBase,
         custom_macros: &[CustomMacroDecl]
     ) -> Result<Node> {
-        let p = TeXParser { context, custom_macros };
+        let p = TeXParser { base: context, custom_macros };
         p.parse_tex(tex)
     }
 
@@ -420,6 +443,10 @@ impl<'a> TeXParser<'a> {
             b"par" => Ok(Node::builtin(BuiltinMacro::ParagraphBreak)),
             b"ldots" => Ok(Node::builtin(BuiltinMacro::Ellipsis)),
             b"this" => Ok(Node::builtin(BuiltinMacro::This)),
+            b"x" => {
+                let c = self.base.parse_unicode_escape_seq(s)?;
+                Ok(Node::text(make_str(&c)))
+            },
             b"ex" | b"comment" => {
                 self.err(&format!("'\\{}' cannot be used in this field", make_str(macro_name)))?;
                 unreachable!();
@@ -482,14 +509,12 @@ impl<'s> Parser<'s> {
     }
 
     /// Check if we're looking at text.
-    fn at(&self, what: &[u8]) -> bool {
-        self.text.starts_with(what)
-    }
+    fn at(&self, what: &[u8]) -> bool { self.text.starts_with(what) }
 
     /// Helper to compile a user-provided regex.
     fn compile_regex(&self, re: &[u8]) -> Result<Regex> {
         let regex = make_str(re);
-        Regex::new(regex).map_err(|e| make_err(&self.context, &format!(
+        Regex::new(regex).map_err(|e| self.base.make_err(&format!(
             "Failed to compile regex '{}': {}",
             regex,
             e.to_string()
@@ -518,9 +543,7 @@ impl<'s> Parser<'s> {
     fn done(&self) -> bool { self.text.is_empty() }
 
     /// Issue a parse error.
-    fn err(&self, msg: &str) -> Result<()> {
-        Err(make_err(&self.context, msg))
-    }
+    fn err(&self, msg: &str) -> Result<()> { Err(self.base.make_err(msg)) }
 
     /// Expect a string.
     fn expect(&mut self, what: &[u8]) -> Result<()> {
@@ -531,7 +554,7 @@ impl<'s> Parser<'s> {
     /// Create a new parser.
     fn new(g: &'s mut Generator, input: &'s str) -> Self {
         Self {
-            context: ParserContext {
+            base: ParserBase {
                 full_input_text: input.as_bytes(),
                 loc: 0,
             },
@@ -541,7 +564,7 @@ impl<'s> Parser<'s> {
     }
 
     /// Normalise a string for sorting.
-    fn normalise_for_sort(&self, text: &'s str) -> SmallCow<'s> {
+    fn normalise_for_sort(&self, text: &'s str) -> Result<SmallCow<'s>> {
         match &self.g.collate {
             None => panic!("Collation not initialised!"),
             Some(coll) => {
@@ -560,7 +583,12 @@ impl<'s> Parser<'s> {
                     );
                 }
 
-                str
+                // If the collation creates an empty word, we have a problem.
+                if str.as_str().trim_ascii().is_empty() {
+                    self.err(&format!("Collation of '{}' resulted in an empty word", text))?;
+                }
+
+                Ok(str)
             },
         }
     }
@@ -573,7 +601,7 @@ impl<'s> Parser<'s> {
         // we've already seen some entries, it won't be applied to those; this is almost
         // certainly not what you want.
         while !self.skip_ws().done() && self.at(b"$") {
-            self.context.save_offset(self.text.text());
+            self.base.save_offset(self.text.text());
             self.parse_directive()?;
         }
 
@@ -582,7 +610,7 @@ impl<'s> Parser<'s> {
 
         // Parse entries.
         while !self.skip_ws().done() {
-            self.context.save_offset(self.text.text());
+            self.base.save_offset(self.text.text());
             if self.at(b"$") { self.err("Directives must precede all entries")?; }
             self.parse_entry()?;
         }
@@ -655,7 +683,7 @@ impl<'s> Parser<'s> {
             return self.err(&format!("A $collate directive was already given on line {}", c.line))
         }
 
-        self.g.collate = Some(CollateDirective { by, ops, line: self.context.loc });
+        self.g.collate = Some(CollateDirective { by, ops, line: self.base.loc });
         Ok(())
     }
 
@@ -669,8 +697,7 @@ impl<'s> Parser<'s> {
         let name: SmallStr = make_str(self.skip_ws().text.take_until_any(b" \t")).into();
         let args = make_str(self.skip_ws().text.take_until_any(b" \t\r\n"));
         let args = args.parse::<u32>().map_err(|e|
-            make_err(
-                &self.context,
+            self.base.make_err(
                 &format!("Argument count '{}' is not a valid integer: {}", args, e.to_string())
             )
         )?;
@@ -690,7 +717,7 @@ impl<'s> Parser<'s> {
             }
         }
 
-        self.g.custom_macros.push(CustomMacroDecl { name, args, line: self.context.loc });
+        self.g.custom_macros.push(CustomMacroDecl { name, args, line: self.base.loc });
         Ok(())
     }
 
@@ -718,7 +745,7 @@ impl<'s> Parser<'s> {
     ///
     /// ```ebnf
     /// <dir-ipa-op> ::= { <string-replacement-op> | <lemma-op> }
-    /// <lemma-op>   ::= "lemma" "{" { <dir-ipa-op> } "}"
+    /// <lemma-op>   ::= "lemma" "{" { <string-replacement-op> } "}"
     /// ```
     fn parse_ipa_replacement_op(&mut self) -> Result<StringReplacementOp> {
         if self.text.consume(b"lemma") {
@@ -729,6 +756,9 @@ impl<'s> Parser<'s> {
             let mut ops = Vec::new();
             while !self.skip_ws().done() && !self.at(b"}") {
                 let op = self.parse_ipa_replacement_op()?;
+                if matches!(op, StringReplacementOp::Lemma { .. }) {
+                    self.err("'lemma {}' cannot appear within 'lemma {}'")?;
+                }
                 ops.push(op);
             }
 
@@ -832,8 +862,8 @@ impl<'s> Parser<'s> {
 
                     // Handle \x{...}.
                     if self.at(b"x{") {
-                        let s = Stream::new(self.text.take_until_and_drop(b"}"));
-                        let seq = self.parse_unicode_escape_seq_after_backslash(s)?;
+                        self.text.drop_byte();
+                        let seq = self.base.parse_unicode_escape_seq(&mut self.text)?;
                         bytes.extend(seq);
                         continue;
                     }
@@ -902,42 +932,24 @@ impl<'s> Parser<'s> {
             for p in &mut patterns { *p = n.apply(p); }
         }
 
+        // The patterns must not contain duplicates.
+        let mut unique = HashSet::new();
+        for p in &patterns {
+            if !unique.insert(p.as_str()) {
+                self.err(&format!("Duplicate pattern '{}' in replacement trie", p))?;
+            }
+        }
+
         Ok(StringReplacementOp::Trie {
             replacements,
             normalisation: norm,
             trie: AhoCorasick::builder()
                 .match_kind(MatchKind::LeftmostLongest)
                 .build(patterns)
-                .map_err(|e| make_err(
-                    &self.context,
+                .map_err(|e| self.base.make_err(
                     &format!("Failed to build trie: {}'", e.to_string())
                 ))?
         })
-    }
-
-    /// Parse a unicode escape sequence.
-    fn parse_unicode_escape_seq_after_backslash(&self, mut seq: Stream) -> Result<SmallVec<[u8; 4]>> {
-        assert!(seq.consume(b"x{"));
-        let code = seq.take_until_and_drop(b"}");
-        if code.len() != 4 { self.err("Expected 4 hex digits in '\\x{...}'")? }
-
-        // Parse the number.
-        let num = u32::from_str_radix(make_str(code), 16)
-            .map_err(|e| make_err(
-                &self.context,
-                &format!("Invalid unicode codepoint '{}': {}", make_str(code), e.to_string())
-            )
-        )?;
-
-        // Convert it to a character.
-        let Some(c) = char::from_u32(num) else {
-            self.err(&format!("Invalid unicode codepoint '{}'", make_str(code)))?;
-            unreachable!();
-        };
-
-        // Append its bytes.
-        let mut buffer = [0u8; 4];
-        Ok(c.encode_utf8(&mut buffer).as_bytes().into())
     }
 
     /// Evaluate unicode escape sequences in a string.
@@ -951,8 +963,8 @@ impl<'s> Parser<'s> {
             } {
                 assert!(word.consume(b"\\"));
                 if word.starts_with(b"x{") {
-                    let s = Stream::new(word.take_until_and_drop(b"}"));
-                    let seq = self.parse_unicode_escape_seq_after_backslash(s)?;
+                    word.drop_byte();
+                    let seq = self.base.parse_unicode_escape_seq(&mut word)?;
                     processed.push_str(make_str(seq.as_ref()));
                 } else {
                     processed.push('\\');
@@ -1069,7 +1081,7 @@ impl<'s> Parser<'s> {
             for word in Stream::new(words).split(b',') {
                 let word = word.trim_ascii();
                 if word.is_empty() { continue }
-                let collated = self.normalise_for_sort(make_str(word));
+                let collated = self.normalise_for_sort(make_str(word))?;
                 let word = self.parse_tex(word)?;
 
                 // Compute search string if requested.
@@ -1133,12 +1145,12 @@ impl<'s> Parser<'s> {
         let mut primary_definition = None;
         let mut senses = SmallVec::<[Sense; 4]>::new();
         let mut def = Stream::new(parts[Part::Def as usize].as_bytes());
-        if !def.trim().is_empty() {
-            let def_text = def.take_until_and_drop(SENSE_MACRO).trim_ascii();
-            if !def_text.is_empty() { primary_definition = Some(self.split_sense(def_text)?) }
-            while !def.trim_start().is_empty() {
-                senses.push(self.split_sense(def.take_until_and_drop(SENSE_MACRO))?);
-            }
+        if def.trim().is_empty() { self.err("Definition must not be empty")?; }
+
+        let def_text = def.take_until_and_drop(SENSE_MACRO).trim_ascii();
+        if !def_text.is_empty() { primary_definition = Some(self.split_sense(def_text)?) }
+        while !def.trim_start().is_empty() {
+            senses.push(self.split_sense(def.take_until_and_drop(SENSE_MACRO))?);
         }
 
         // Forms and IPA override.
@@ -1152,10 +1164,13 @@ impl<'s> Parser<'s> {
             ipa = Some(self.parse_tex(parts[Part::IPA as usize].as_bytes())?);
         }
 
+        // The word must not be empty.
+        let word = make_str(word.unwrap()).trim_ascii();
+        if word.is_empty() { self.err("Lemma must not be empty")?; }
+
         // Create a canonicalised form of this entry for sorting.
-        let word = word.unwrap();
-        let collated = self.normalise_for_sort(make_str(word));
-        let word = self.parse_tex(word)?;
+        let collated = self.normalise_for_sort(word)?;
+        let word = self.parse_tex(word.as_bytes())?;
         let plain_word = word.render_plain_text(true);
 
         // If requested, also add search keys.
@@ -1202,7 +1217,7 @@ impl<'s> Parser<'s> {
 
     /// Parse LaTeX.
     fn parse_tex(&self, tex: &[u8]) -> Result<Node> {
-        TeXParser::parse_with_context(tex, &self.context, &self.g.custom_macros)
+        TeXParser::parse_with_context(tex, &self.base, &self.g.custom_macros)
     }
 
     /// Parse LaTeX and append a full stop.

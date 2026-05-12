@@ -94,6 +94,14 @@ mod test {
 
         // References are preserved.
         check!("x\\ref{abab}y", "{\"group\":[{\"text\":\"x\"},{\"macro\":{\"name\":\"reference\",\"args\":[{\"text\":\"abab\"}]}},{\"text\":\"y\"}]}");
+
+        // Unicode escape sequence.
+        check!("\\x{de}", "{\"text\":\"Þ\"}");
+        check_err!("\\x", "Error near line 1: Expected '{' after '\\x'");
+        check_err!("\\x{", "Error near line 1: Missing '}' in Unicode escape sequence");
+        check_err!("\\x{}", "Error near line 1: Expected at least 1 digit in '\\x{...}'");
+        check_err!("\\x{100000000}", "Error near line 1: Invalid unicode codepoint '100000000'");
+        check_err!("\\x{q}", "Error near line 1: Invalid unicode codepoint 'q'");
     }
 
     #[test]
@@ -1056,6 +1064,31 @@ mod test {
                 ]
             }
         "#);
+
+        check!("a\\x{de}|b\\x{0de}|c\\x{00de}|\\x{000000de}", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "aÞ"
+                        },
+                        "pos": {
+                            "text": "bÞ"
+                        },
+                        "etym": {
+                            "text": "cÞ"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "text": "Þ."
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": ""
+                    }
+                ]
+            }
+        "#);
     }
 
     #[test]
@@ -1165,6 +1198,16 @@ mod test {
         check_err!("a\\comment > b", "Error near line 1: '\\comment' cannot be used in a reference entry");
         check_err!("a\\ex > b", "Error near line 1: '\\ex' cannot be used in a reference entry");
         check_err!("a\\\\ > b", "Error near line 1: '\\\\' cannot be used in a reference entry");
+
+        check_err!("|a|b|c", "Error near line 1: Lemma must not be empty");
+        check_err!("    |a|b|c", "Error near line 1: Lemma must not be empty");
+        check_err!("  \t |a|b|c", "Error near line 1: Lemma must not be empty");
+        check_err!("a|b|c|", "Error near line 1: Definition must not be empty");
+        check_err!("a|b|c| ", "Error near line 1: Definition must not be empty");
+        check_err!("a|b|c|    ", "Error near line 1: Definition must not be empty");
+        check_err!("a|b|c|  \t  ", "Error near line 1: Definition must not be empty");
+        check_err!("a|b|c|\n", "Error near line 1: Definition must not be empty");
+        check_err!("a|b|c|  \n  ", "Error near line 1: Definition must not be empty");
     }
 
     #[test]
@@ -1249,6 +1292,24 @@ mod test {
         }
 
         {
+            let mut g = Generator::new(Default::default());
+            assert_eq!(
+                g.parse("$ipa { trie { [aa] => b } }").unwrap_err(),
+                "Error near line 1: Duplicate pattern 'a' in replacement trie"
+            );
+
+            assert_eq!(
+                g.parse("$ipa { trie { [a] => b \n a => b } }").unwrap_err(),
+                "Error near line 1: Duplicate pattern 'a' in replacement trie"
+            );
+
+            assert_eq!(
+                g.parse("$ipa { trie { a => b \n a => b } }").unwrap_err(),
+                "Error near line 1: Duplicate pattern 'a' in replacement trie"
+            );
+        }
+
+        {
             check!(StringReplacementOp::Lemma(vec![Lower]), "ABCD", "abcd", true);
             check!(StringReplacementOp::Lemma(vec![Lower]), "ABCD", "ABCD", false);
         }
@@ -1256,7 +1317,34 @@ mod test {
 
     #[test]
     fn test_collate() {
+        {
+            let mut g = Generator::new(Default::default());
+            g.parse("$collate { by \"αβγδεϝζηθικϗλꟜμνξοπρσςτυφχψωȣ\" }").unwrap();
+        }
+
+        {
+            let mut g = Generator::new(Default::default());
+            g.parse("$collate { by \"abcd\" }").unwrap();
+            assert_eq!(
+                g.parse("qqqq|q|q|q").unwrap_err(),
+                "Error near line 1: Collation of 'qqqq' resulted in an empty word"
+            );
+        }
+
+        {
+            let mut g = Generator::new(Default::default());
+            g.parse("$collate { preprocess { s/.// } }").unwrap();
+            assert_eq!(
+                g.parse("qqqq|q|q|q").unwrap_err(),
+                "Error near line 1: Collation of 'qqqq' resulted in an empty word"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ipa_dir_error() {
         let mut g = Generator::new(Default::default());
-        g.parse("$collate { by \"αβγδεϝζηθικϗλꟜμνξοπρσςτυφχψωȣ\" }").unwrap();
+        g.parse("$ipa { lemma { } }").unwrap();
+        assert_eq!(g.parse("$ipa { lemma { lemma {} } }").unwrap_err(), "Error near line 1: 'lemma {}' cannot appear within 'lemma {}'");
     }
 }
