@@ -1307,6 +1307,8 @@ mod test {
                 g.parse("$ipa { trie { a => b \n a => b } }").unwrap_err(),
                 "Error near line 1: Duplicate pattern 'a' in replacement trie"
             );
+
+            g.parse("$ipa { trie { [] => * \n [] => * } }").unwrap();
         }
 
         {

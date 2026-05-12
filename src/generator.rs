@@ -548,7 +548,13 @@ impl<'s> Parser<'s> {
     /// Expect a string.
     fn expect(&mut self, what: &[u8]) -> Result<()> {
         if self.text.consume(what) { Ok(()) }
-        else { self.err(&format!("Expected '{}'", make_str(what))) }
+        else {
+            self.err(&format!(
+                "Expected '{}', but found '\\x{:x}'",
+                make_str(what),
+                self.text.front().unwrap_or(0),
+            ))
+        }
     }
 
     /// Create a new parser.
@@ -895,16 +901,18 @@ impl<'s> Parser<'s> {
             }
 
             // <word>
-            while {
-                let word = self.text.take_until_either(b"=>", b"|");
-                let word = self.process_unicode_escapes(word)?;
-                patterns.push(word);
-                n += 1;
-                self.text.consume(b"|")
-            } {}
+            else {
+                while {
+                    let word = self.text.take_until_either(b"=>", b"|");
+                    let word = self.process_unicode_escapes(word)?;
+                    patterns.push(word);
+                    n += 1;
+                    self.text.consume(b"|")
+                } {}
+            }
 
             // Parse '=>'
-            self.expect(b"=>")?;
+            self.skip_ws().expect(b"=>")?;
 
             // Get replacement text.
             self.skip_ws();
@@ -940,6 +948,7 @@ impl<'s> Parser<'s> {
             }
         }
 
+        assert_eq!(patterns.len(), replacements.len());
         Ok(StringReplacementOp::Trie {
             replacements,
             normalisation: norm,
