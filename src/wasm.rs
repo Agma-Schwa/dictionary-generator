@@ -27,13 +27,15 @@ pub fn wasm_parse_dictionary_file(opts: &[u8], content: &[u8]) -> Result<Vec<u8>
         pretty_json: false,
         populate_search_fields: false,
         always_include_ipa: opts[0] != 0,
+        colour: false,
+        keep_parsing: false,
     });
 
     let Ok(content) = str::from_utf8(content) else {
         return Err("wasm_parse_dictionary_file(): Input was invalid UTF-8".into());
     };
 
-    g.parse(content)?;
+    g.parse(content, "<dictionary>")?;
     GENERATOR_INSTANCE.set(g).unwrap();
     Ok(vec![])
 }

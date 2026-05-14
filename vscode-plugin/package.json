@@ -3,7 +3,7 @@
   "displayName": "dictionary-file-format",
   "description": "Syntax highlighting for the dictionary file format used by the ULTRAFRENCH dictionary",
   "repository": "https://github.com/Agma-Schwa/dictionary-generator",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "engines": {
     "vscode": "^1.100.0"
   },

@@ -64,6 +64,12 @@ pub struct Options {
 
     /// Pretty-print JSON.
     pub pretty_json: bool,
+
+    /// Enable colour diagnostics.
+    pub colour: bool,
+
+    /// Keep parsing after an error. In this mode, diagnostics are collected and concatenated.
+    pub keep_parsing: bool,
 }
 
 // You can't define a function that is generic on mutability, so the sledgehammer
@@ -178,6 +184,6 @@ pub fn parse_and_generate(
     opts: Options,
 ) -> Result<String> {
     let mut g = generator::Generator::new(opts);
-    g.parse(input)?;
+    g.parse(input, "<input>")?;
     Ok(g.json())
 }

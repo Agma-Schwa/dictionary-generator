@@ -2,21 +2,70 @@
 mod test {
     use super::*;
 
+    fn dedent(s: &str) -> String {
+        let indent = s.split('\n')
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.len() - line.trim_start().len())
+            .min()
+            .unwrap_or(0);
+
+        let mut res = String::new();
+        for line in s.trim().split('\n') {
+            res.push('\n');
+            if line.trim().is_empty() { continue; }
+            let start = indent.min(line.len() - line.trim_start().len());
+            res.push_str(&line[start..]);
+        }
+
+        res.trim().to_string()
+    }
+
+    // The way in which assert_eq!() prints its inputs isn't suitable for us, so we roll our own.
+    macro_rules! assert_eq {
+        ($left:expr, $right:expr $(,)?) => {
+            match (&$left, &$right) {
+                (left, right) => {
+                    let right = dedent(right);
+                    if !(left.trim() == right) {
+                        panic!(
+                            "EQ failed:\n==== LEFT ====\n{}\n==== RIGHT ====\n{}\n==== END ====",
+                            left.trim(),
+                            right
+                        )
+                    }
+                }
+            }
+        };
+    }
+
+    macro_rules! assert_contains {
+        ($left:expr, $right:expr $(,)?) => {
+            match (&$left, &$right) {
+                (left, right) => {
+                    let right = dedent(right);
+                    if !(left.contains(&right)) {
+                        panic!(
+                            "CONTAINS failed:\n==== LEFT ====\n{}\n==== RIGHT ====\n{}\n==== END ====",
+                            left.trim(),
+                            right
+                        )
+                    }
+                }
+            }
+        };
+    }
+
     #[test]
     fn test_tex_parser() {
-        let mut g = Generator::new(Default::default());
-
         macro_rules! check {
             ($in:literal, $out:literal) => {
-                let p = Parser::new(&mut g, $in);
-                assert_eq!(p.parse_tex($in.as_bytes()).unwrap().render(), $out);
+                assert_eq!(TeXParser::parse($in, &[], false).unwrap().render(), $out);
             };
         }
 
         macro_rules! check_err {
             ($in:literal, $out:literal) => {
-                let p = Parser::new(&mut g, $in);
-                assert_eq!(p.parse_tex($in.as_bytes()).unwrap_err(), $out);
+                assert_contains!(TeXParser::parse($in, &[], false).unwrap_err(), $out);
             };
         }
 
@@ -32,12 +81,12 @@ mod test {
         check!("{{{{{{a}}{b}{{c}}}}}}", "{\"text\":\"abc\"}");
 
         // Missing braces.
-        check_err!("{", "Error near line 1: Unexpected end of input. Did you forget a '}}'?");
-        check_err!("{{}", "Error near line 1: Unexpected end of input. Did you forget a '}}'?");
-        check_err!("}", "Error near line 1: Too many '}'s!");
-        check_err!("{}}", "Error near line 1: Too many '}'s!");
-        check_err!("{}{", "Error near line 1: Unexpected end of input. Did you forget a '}}'?");
-        check_err!("{}{}}", "Error near line 1: Too many '}'s!");
+        check_err!("{", "Unexpected end of input. Did you forget a '}'?");
+        check_err!("{{}", "Unexpected end of input. Did you forget a '}'?");
+        check_err!("}", "Too many '}'s!");
+        check_err!("{}}", "Too many '}'s!");
+        check_err!("{}{", "Unexpected end of input. Did you forget a '}'?");
+        check_err!("{}{}}", "Too many '}'s!");
 
         // Maths.
         check!("$a$", "{\"math\":\"a\"}");
@@ -65,17 +114,17 @@ mod test {
         check!("{\\#}", "{\"text\":\"#\"}");
 
         // Unsupported single-character macros.
-        check_err!("\\@", "Error near line 1: Unknown macro '\\@'; did you forget to '$declare @ 0' somewhere?");
-        check_err!("\\[", "Error near line 1: Unknown macro '\\['; did you forget to '$declare [ 0' somewhere?");
-        check_err!("\\]", "Error near line 1: Unknown macro '\\]'; did you forget to '$declare ] 0' somewhere?");
+        check_err!("\\@", "Unknown macro '\\@'; did you forget to '$declare @ 0' somewhere?");
+        check_err!("\\[", "Unknown macro '\\['; did you forget to '$declare [ 0' somewhere?");
+        check_err!("\\]", "Unknown macro '\\]'; did you forget to '$declare ] 0' somewhere?");
 
         // Missing macro name.
-        check_err!("\\", "Error near line 1: Invalid macro escape sequence");
+        check_err!("\\", "Invalid macro escape sequence");
 
         // Special macros aren't normally valid.
-        check_err!("\\\\", "Error near line 1: '\\\\' cannot be used in this field");
-        check_err!("\\ex", "Error near line 1: '\\ex' cannot be used in this field");
-        check_err!("\\comment", "Error near line 1: '\\comment' cannot be used in this field");
+        check_err!("\\\\", "'\\\\' cannot be used in this field");
+        check_err!("\\ex", "'\\ex' cannot be used in this field");
+        check_err!("\\comment", "'\\comment' cannot be used in this field");
 
         // Builtin single-argument macros.
         check!("\\s{a}{b}", "{\"group\":[{\"macro\":{\"name\":\"small_caps\",\"args\":[{\"text\":\"a\"}]}},{\"text\":\"b\"}]}");
@@ -97,22 +146,26 @@ mod test {
 
         // Unicode escape sequence.
         check!("\\x{de}", "{\"text\":\"Þ\"}");
-        check_err!("\\x", "Error near line 1: Expected '{' after '\\x'");
-        check_err!("\\x{", "Error near line 1: Missing '}' in Unicode escape sequence");
-        check_err!("\\x{}", "Error near line 1: Expected at least 1 digit in '\\x{...}'");
-        check_err!("\\x{100000000}", "Error near line 1: Invalid unicode codepoint '100000000'");
-        check_err!("\\x{q}", "Error near line 1: Invalid unicode codepoint 'q'");
+        check_err!("\\x", "Expected '{' after '\\x'");
+        check_err!("\\x{", "Missing '}' in Unicode escape sequence");
+        check_err!("\\x{}", "Expected at least 1 digit in '\\x{...}'");
+        check_err!("\\x{100000000}", "Invalid unicode codepoint '100000000'");
+        check_err!("\\x{q}", "Invalid unicode codepoint 'q'");
+
+        // Whitespace folding.
+        check!("  \n\r\t a b    c \n\t\r\n\t  d  \n \r \t", "{\"text\":\"a b c d\"}");
     }
 
     #[test]
     fn test_declare_directive() {
-        let mut g = Generator::new(Default::default());
-        g.parse("$declare foo 0\n$declare bar 1\n").unwrap();
+        let custom_macros = vec![
+            CustomMacroDecl { name: "foo".into(), args: 0, loc: SourceRange(None) },
+            CustomMacroDecl { name: "bar".into(), args: 1, loc: SourceRange(None) },
+        ];
 
         macro_rules! check {
             ($in:literal, $out:literal) => {
-                let p = Parser::new(&mut g, $in);
-                let node = p.parse_tex($in.as_bytes()).unwrap().render();
+                let node = TeXParser::parse($in, &custom_macros, false).unwrap().render();
                 assert_eq!(
                     json::parse(&node).unwrap().to_string(),
                     json::parse($out).unwrap().to_string()
@@ -122,24 +175,23 @@ mod test {
 
         macro_rules! check_err {
             ($in:literal, $out:literal) => {
-                let p = Parser::new(&mut g, $in);
-                let res = p.parse_tex($in.as_bytes());
-                assert_eq!(res.unwrap_err().to_string(), $out);
+                let res = TeXParser::parse($in, &custom_macros, false);
+                assert_contains!(res.unwrap_err().to_string(), $out);
             };
         }
 
         check!("\\foo", "{\"custom_macro\":{\"name\":\"foo\"}}");
         check!("\\bar{xyz}", "{\"custom_macro\":{\"name\":\"bar\",\"args\":[{\"text\":\"xyz\"}]}}");
 
-        check_err!("\\bar", "Error near line 1: Macro '\\bar' expects 1 argument, but got 0");
-        check_err!("\\bar{123}{234}", "Error near line 1: Macro '\\bar' expects 1 argument, but got 2");
-        check_err!("\\foo{xyz}", "Error near line 1: Macro '\\foo' expects 0 arguments, but got 1");
-        check_err!("\\foo{xyz}{abc}", "Error near line 1: Macro '\\foo' expects 0 arguments, but got 2");
+        check_err!("\\bar", "Macro '\\bar' expects 1 argument, but got 0");
+        check_err!("\\bar{123}{234}", "Macro '\\bar' expects 1 argument, but got 2");
+        check_err!("\\foo{xyz}", "Macro '\\foo' expects 0 arguments, but got 1");
+        check_err!("\\foo{xyz}{abc}", "Macro '\\foo' expects 0 arguments, but got 2");
     }
 
     macro_rules! check_with_generator {
         ($g:expr, $in: literal, $out: literal) => {
-            $g.parse($in).unwrap();
+            $g.parse($in, "<input>").unwrap();
 
             // Use json::parse() on both sides so we can format the expected JSON output
             // in a way that is actually legible while still comparing the json without
@@ -1089,6 +1141,58 @@ mod test {
                 ]
             }
         "#);
+
+        // Trailing newline.
+        check!("a|b|c|d\n", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "pos": {
+                            "text": "b"
+                        },
+                        "etym": {
+                            "text": "c"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "text": "d."
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": "d"
+                    }
+                ]
+            }
+        "#);
+
+        // Comments.
+        check!("a|b|c|d aefaef #comment\n#comment\n foo#comment\n bar #comment", r#"
+            {
+                "entries": [
+                    {
+                        "word": {
+                            "text": "a"
+                        },
+                        "pos": {
+                            "text": "b"
+                        },
+                        "etym": {
+                            "text": "c"
+                        },
+                        "primary_definition": {
+                            "def": {
+                                "text": "d aefaef foo bar."
+                            }
+                        },
+                        "hw_search": "a",
+                        "def_search": "aefaef bar d foo"
+                    }
+                ]
+            }
+        "#);
     }
 
     #[test]
@@ -1096,124 +1200,124 @@ mod test {
         let mut g = Generator::new(Default::default());
         macro_rules! check_err {
             ($in:literal, $out:literal) => {
-                assert_eq!(g.parse($in).unwrap_err(), $out);
+                assert_contains!(g.parse($in, "<input>").unwrap_err(), $out);
             };
         }
 
         check_err!(
             "x|y|z|\\comment abcd",
-            "Error near line 1: \\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead."
+            "\\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead."
         );
 
         check_err!(
             "x|y|z|\\\\\\comment abcd",
-            "Error near line 1: \\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead."
+            "\\comment is not allowed in an empty sense or empty primary definition. Use \\i{...} instead."
         );
 
         check_err!(
             "x|y|z|\\ex abcd",
-            "Error near line 1: \\ex is not allowed in an empty sense or empty primary definition."
+            "\\ex is not allowed in an empty sense or empty primary definition."
         );
 
         check_err!(
             "x|y|z|\\\\\\ex abcd",
-            "Error near line 1: \\ex is not allowed in an empty sense or empty primary definition."
+            "\\ex is not allowed in an empty sense or empty primary definition."
         );
 
         check_err!(
             "\\\\a|||",
-            "Error near line 1: '\\\\' cannot be used in the lemma"
+            "'\\\\' cannot be used in the lemma"
         );
 
         check_err!(
             "\\comment|||",
-            "Error near line 1: '\\comment' cannot be used in the lemma"
+            "'\\comment' cannot be used in the lemma"
         );
 
         check_err!(
             "\\ex|||",
-            "Error near line 1: '\\ex' cannot be used in the lemma"
+            "'\\ex' cannot be used in the lemma"
         );
 
         check_err!(
             "foo",
-            "Error near line 1: An entry must contain at least one '|' or '>'"
+            "An entry must contain at least one '|' or '>'"
         );
 
         check_err!(
             "\\comment > b",
-            "Error near line 1: '\\comment' cannot be used in a reference entry"
+            "'\\comment' cannot be used in a reference entry"
         );
 
         check_err!(
             "a > \\comment",
-            "Error near line 1: '\\comment' cannot be used in a reference entry"
+            "'\\comment' cannot be used in a reference entry"
         );
 
         check_err!(
             "\\ex > b",
-            "Error near line 1: '\\ex' cannot be used in a reference entry"
+            "'\\ex' cannot be used in a reference entry"
         );
 
         check_err!(
             "a > \\ex",
-            "Error near line 1: '\\ex' cannot be used in a reference entry"
+            "'\\ex' cannot be used in a reference entry"
         );
 
         check_err!(
             "\\\\ > b",
-            "Error near line 1: '\\\\' cannot be used in a reference entry"
+            "'\\\\' cannot be used in a reference entry"
         );
 
         check_err!(
             "a > \\\\",
-            "Error near line 1: '\\\\' cannot be used in a reference entry"
+            "'\\\\' cannot be used in a reference entry"
         );
 
         check_err!(
             "a|b|c|d \\comment abc \\comment abc",
-            "Error near line 1: '\\comment' cannot be used in a comment"
+            "'\\comment' cannot be used in a comment"
         );
 
-        check_err!("a\\comment|b|c|d", "Error near line 1: '\\comment' cannot be used in the lemma");
-        check_err!("a\\ex|b|c|d", "Error near line 1: '\\ex' cannot be used in the lemma");
-        check_err!("a\\\\|b|c|d", "Error near line 1: '\\\\' cannot be used in the lemma");
+        check_err!("a\\comment|b|c|d", "'\\comment' cannot be used in the lemma");
+        check_err!("a\\ex|b|c|d", "'\\ex' cannot be used in the lemma");
+        check_err!("a\\\\|b|c|d", "'\\\\' cannot be used in the lemma");
 
-        check_err!("a|b\\comment|c|d", "Error near line 1: '\\comment' cannot be used in this field");
-        check_err!("a|b\\ex|c|d", "Error near line 1: '\\ex' cannot be used in this field");
-        check_err!("a|b\\\\|c|d", "Error near line 1: '\\\\' cannot be used in this field");
+        check_err!("a|b\\comment|c|d", "'\\comment' cannot be used in this field");
+        check_err!("a|b\\ex|c|d", "'\\ex' cannot be used in this field");
+        check_err!("a|b\\\\|c|d", "'\\\\' cannot be used in this field");
 
-        check_err!("a|b|c\\comment|d", "Error near line 1: '\\comment' cannot be used in this field");
-        check_err!("a|b|c\\ex|d", "Error near line 1: '\\ex' cannot be used in this field");
-        check_err!("a|b|c\\\\|d", "Error near line 1: '\\\\' cannot be used in this field");
+        check_err!("a|b|c\\comment|d", "'\\comment' cannot be used in this field");
+        check_err!("a|b|c\\ex|d", "'\\ex' cannot be used in this field");
+        check_err!("a|b|c\\\\|d", "'\\\\' cannot be used in this field");
 
-        check_err!("a|b|c|d|\\comment", "Error near line 1: '\\comment' cannot be used in this field");
-        check_err!("a|b|c|d|\\ex", "Error near line 1: '\\ex' cannot be used in this field");
-        check_err!("a|b|c|d|\\\\", "Error near line 1: '\\\\' cannot be used in this field");
+        check_err!("a|b|c|d|\\comment", "'\\comment' cannot be used in this field");
+        check_err!("a|b|c|d|\\ex", "'\\ex' cannot be used in this field");
+        check_err!("a|b|c|d|\\\\", "'\\\\' cannot be used in this field");
 
-        check_err!("a > b \\comment", "Error near line 1: '\\comment' cannot be used in a reference entry");
-        check_err!("a > b \\ex", "Error near line 1: '\\ex' cannot be used in a reference entry");
-        check_err!("a > b \\\\", "Error near line 1: '\\\\' cannot be used in a reference entry");
+        check_err!("a > b \\comment", "'\\comment' cannot be used in a reference entry");
+        check_err!("a > b \\ex", "'\\ex' cannot be used in a reference entry");
+        check_err!("a > b \\\\", "'\\\\' cannot be used in a reference entry");
 
-        check_err!("a\\comment > b", "Error near line 1: '\\comment' cannot be used in a reference entry");
-        check_err!("a\\ex > b", "Error near line 1: '\\ex' cannot be used in a reference entry");
-        check_err!("a\\\\ > b", "Error near line 1: '\\\\' cannot be used in a reference entry");
+        check_err!("a\\comment > b", "'\\comment' cannot be used in a reference entry");
+        check_err!("a\\ex > b", "'\\ex' cannot be used in a reference entry");
+        check_err!("a\\\\ > b", "'\\\\' cannot be used in a reference entry");
 
-        check_err!("|a|b|c", "Error near line 1: Lemma must not be empty");
-        check_err!("    |a|b|c", "Error near line 1: Lemma must not be empty");
-        check_err!("  \t |a|b|c", "Error near line 1: Lemma must not be empty");
-        check_err!("a|b|c|", "Error near line 1: Definition must not be empty");
-        check_err!("a|b|c| ", "Error near line 1: Definition must not be empty");
-        check_err!("a|b|c|    ", "Error near line 1: Definition must not be empty");
-        check_err!("a|b|c|  \t  ", "Error near line 1: Definition must not be empty");
-        check_err!("a|b|c|\n", "Error near line 1: Definition must not be empty");
-        check_err!("a|b|c|  \n  ", "Error near line 1: Definition must not be empty");
+        check_err!("|a|b|c", "Lemma must not be empty");
+        check_err!("    |a|b|c", "Lemma must not be empty");
+        check_err!("  \t |a|b|c", "Lemma must not be empty");
+        check_err!("a|b|c|", "Definition must not be empty");
+        check_err!("a|b|c| ", "Definition must not be empty");
+        check_err!("a|b|c|    ", "Definition must not be empty");
+        check_err!("a|b|c|  \t  ", "Definition must not be empty");
+        check_err!("a|b|c|\n", "Definition must not be empty");
+        check_err!("a|b|c|  \n  ", "Definition must not be empty");
     }
 
     #[test]
     fn test_always_generate_ipa() {
         let mut g = Generator::new(Options { always_include_ipa: true, ..Default::default() });
-        g.parse("$ipa { s|(.+)|/$1:$1/| }\n").unwrap();
+        g.parse("$ipa { s|(.+)|/$1:$1/| }\n", "<input>").unwrap();
         check_with_generator!(g, "a|b|c|d", r#" {
             "entries": [
                 {
@@ -1243,15 +1347,15 @@ mod test {
     #[test]
     fn test_preprocess_full_entry() {
         let mut g = Generator::new(Default::default());
-        g.parse("$preprocess { pos { !m/./ \"foobar\" } } \n").unwrap();
+        g.parse("$preprocess { pos { !m/./ \"foobar\" } } \n", "<input>").unwrap();
 
         macro_rules! check_err {
             ($in:literal, $out:literal) => {
-                assert_eq!(g.parse($in).unwrap_err(), $out);
+                assert_contains!(g.parse($in, "<input>").unwrap_err(), $out);
             };
         }
 
-        check_err!("a|b|c|d", "Error near line 1: foobar");
+        check_err!("a|b|c|d", "foobar");
     }
 
     // Test applying replacements.
@@ -1272,43 +1376,43 @@ mod test {
 
         {
             let mut g = Generator::new(Default::default());
-            g.parse(r#"$preprocess { etym { s/^(\d+) (.+)$/\psc{$1}{$2}/ } }"#).unwrap();
+            g.parse(r#"$preprocess { etym { s/^(\d+) (.+)$/\psc{$1}{$2}/ } }"#, "<input>").unwrap();
             let PreprocessOp::Replace(op) = &g.preprocessor.first().unwrap().op else { unreachable!() };
             check!(op, "50 foobar", r#"\psc{50}{foobar}"#);
         }
 
         {
             let mut g = Generator::new(Default::default());
-            g.parse("$preprocess { etym { trie (nfd) { f|o => *\n } } }").unwrap();
+            g.parse("$preprocess { etym { trie (nfd) { f|o => *\n } } }", "<input>").unwrap();
             let PreprocessOp::Replace(op) = &g.preprocessor.first().unwrap().op else { unreachable!() };
             check!(op, "50 foobar", r#"50 bar"#);
         }
 
         {
             let mut g = Generator::new(Default::default());
-            g.parse(r#"$preprocess { etym { s/./\x{1234}/ } }"#).unwrap();
+            g.parse(r#"$preprocess { etym { s/./\x{1234}/ } }"#, "<input>").unwrap();
             let PreprocessOp::Replace(op) = &g.preprocessor.first().unwrap().op else { unreachable!() };
             check!(op, "abcd", "\u{1234}\u{1234}\u{1234}\u{1234}");
         }
 
         {
             let mut g = Generator::new(Default::default());
-            assert_eq!(
-                g.parse("$ipa { trie { [aa] => b } }").unwrap_err(),
-                "Error near line 1: Duplicate pattern 'a' in replacement trie"
+            assert_contains!(
+                g.parse("$ipa { trie { [aa] => b } }", "<input>").unwrap_err(),
+                "Duplicate pattern 'a' in replacement trie"
             );
 
-            assert_eq!(
-                g.parse("$ipa { trie { [a] => b \n a => b } }").unwrap_err(),
-                "Error near line 1: Duplicate pattern 'a' in replacement trie"
+            assert_contains!(
+                g.parse("$ipa { trie { [a] => b \n a => b } }", "<input>").unwrap_err(),
+                "Duplicate pattern 'a' in replacement trie"
             );
 
-            assert_eq!(
-                g.parse("$ipa { trie { a => b \n a => b } }").unwrap_err(),
-                "Error near line 1: Duplicate pattern 'a' in replacement trie"
+            assert_contains!(
+                g.parse("$ipa { trie { a => b \n a => b } }", "<input>").unwrap_err(),
+                "Duplicate pattern 'a' in replacement trie"
             );
 
-            g.parse("$ipa { trie { [] => * \n [] => * } }").unwrap();
+            g.parse("$ipa { trie { [] => * \n [] => * } }", "<input>").unwrap();
         }
 
         {
@@ -1321,32 +1425,90 @@ mod test {
     fn test_collate() {
         {
             let mut g = Generator::new(Default::default());
-            g.parse("$collate { by \"αβγδεϝζηθικϗλꟜμνξοπρσςτυφχψωȣ\" }").unwrap();
+            g.parse("$collate { by \"αβγδεϝζηθικϗλꟜμνξοπρσςτυφχψωȣ\" }", "<input>").unwrap();
         }
 
         {
             let mut g = Generator::new(Default::default());
-            g.parse("$collate { by \"abcd\" }").unwrap();
-            assert_eq!(
-                g.parse("qqqq|q|q|q").unwrap_err(),
-                "Error near line 1: Collation of 'qqqq' resulted in an empty word"
+            g.parse("$collate { by \"abcd\" }", "<input>").unwrap();
+            assert_contains!(
+                g.parse("qqqq|q|q|q", "<input>").unwrap_err(),
+                "Collation of 'qqqq' resulted in an empty word"
             );
         }
 
         {
             let mut g = Generator::new(Default::default());
-            g.parse("$collate { preprocess { s/.// } }").unwrap();
-            assert_eq!(
-                g.parse("qqqq|q|q|q").unwrap_err(),
-                "Error near line 1: Collation of 'qqqq' resulted in an empty word"
+            g.parse("$collate { preprocess { s/.// } }", "<input>").unwrap();
+            assert_contains!(
+                g.parse("qqqq|q|q|q", "<input>").unwrap_err(),
+                "Collation of 'qqqq' resulted in an empty word"
             );
         }
     }
 
     #[test]
-    fn test_ipa_dir_error() {
+    fn test_dir_errors() {
         let mut g = Generator::new(Default::default());
-        g.parse("$ipa { lemma { } }").unwrap();
-        assert_eq!(g.parse("$ipa { lemma { lemma {} } }").unwrap_err(), "Error near line 1: 'lemma {}' cannot appear within 'lemma {}'");
+        g.parse("$ipa { lemma { } }", "<input>").unwrap();
+        assert_contains!(
+            g.parse("$ipa { lemma { lemma {} } }", "<input>").unwrap_err(),
+            "'lemma {}' cannot appear within 'lemma {}'"
+        );
+
+        assert_contains!(
+            g.parse("$declare abþd 2", "<input>").unwrap_err(),
+            "Invalid character 'þ' in macro name"
+        );
+
+        assert_contains!(
+            g.parse("$declare abþ 2", "<input>").unwrap_err(),
+            "Invalid character 'þ' in macro name"
+        );
+    }
+
+    #[test]
+    fn test_caret() {
+        let mut g = Generator::new(Default::default());
+        macro_rules! check_err {
+            ($in:literal, $out:literal) => {
+                assert_eq!(g.parse($in, "<input>").unwrap_err(), $out);
+            };
+        }
+
+        // Test that the caret and source ranges are placed properly.
+        check_err!("$ipa {\n  trie {\n    [abcda] => 3 \n }\n }", r"
+            Error: Parse Error
+               ╭─[ <input>:3:10 ]
+               │
+             3 │     [abcda] => 3
+               │      ┬   ┬
+               │      ╰────── Previous instance was here
+               │          │
+               │          ╰── Duplicate pattern 'a' in replacement trie
+            ───╯
+        ");
+
+        check_err!("$ipa {\n  trie {\n    a|a => 3 \n }\n }", r"
+            Error: Parse Error
+               ╭─[ <input>:3:7 ]
+               │
+             3 │     a|a => 3
+               │     ┬ ┬
+               │     ╰──── Previous instance was here
+               │       │
+               │       ╰── Duplicate pattern 'a' in replacement trie
+            ───╯
+        ");
+
+        check_err!("a|b|c|d\n    \\comment foo\n    \\comment bar", r"
+            Error: Parse Error
+               ╭─[ <input>:3:5 ]
+               │
+             3 │     \comment bar
+               │     ────┬───
+               │         ╰───── '\comment' cannot be used in a comment
+            ───╯
+        ");
     }
 }

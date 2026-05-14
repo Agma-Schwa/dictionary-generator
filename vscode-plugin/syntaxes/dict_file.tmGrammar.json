@@ -8,10 +8,12 @@
         { "include": "#directive_declare" },
         { "include": "#delimiter" },
         { "include": "#keyword" },
+        { "include": "#unicode_escape" },
         { "include": "#macro" },
         { "include": "#macro_with_arg" },
         { "include": "#custom_macro_with_arg" },
         { "include": "#custom_macro" },
+        { "include": "#macro_arg" },
         { "include": "#escape" },
         { "include": "#directive" },
         { "include": "#invalid" }
@@ -199,8 +201,12 @@
             "match": "\\\\( |&|\\$|%|#|\\{|\\})",
             "name": "constant.character.escape"
         },
+        "unicode_escape": {
+            "match": "\\\\x\\{\\d+\\}",
+            "name": "constant.character.escape"
+        },
         "macro_with_arg": {
-            "begin": "\\\\(s|w|i|b|textit|textbf|textnf|senseref|Sup|Sub|ref|label|pf|psc)\\{",
+            "begin": "\\\\(s|w|i|b|textit|textbf|textnf|senseref|Sup|Sub|ref|label)\\{",
             "end": "\\}",
             "beginCaptures": {
                 "0": { "name": "entity.name.function" }
@@ -230,6 +236,16 @@
         "custom_macro": {
             "match": "\\\\([a-zA-Z]+)",
             "name": "entity.name.function.dictgen-custom-macro"
+        },
+        "macro_arg": {
+            "begin": "\\{",
+            "end": "\\}",
+            "beginCaptures": {
+                "0": { "name": "entity.name.function.dictgen-custom-macro" }
+            },
+            "endCaptures": {
+                "0": { "name": "entity.name.function.dictgen-custom-macro" }
+            }
         },
         "invalid": {
             "match": "\\$|&|%|\\\\|\\^|_|\\{|\\}",

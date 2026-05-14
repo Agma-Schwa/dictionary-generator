@@ -1,6 +1,8 @@
-use std::fs::read_to_string;
-use dictgen::Options;
 use clap::Parser;
+use dictgen::Options;
+use std::fs::read_to_string;
+use std::io::{stderr, IsTerminal};
+use std::process::exit;
 
 #[derive(Parser)]
 struct Args {
@@ -18,6 +20,9 @@ struct Args {
 
     /// Whether to populate fields used for searching in the frontend.
     #[arg(long, default_value_t = false)] search: bool,
+
+    /// Stop after a single error.
+    #[arg(long, default_value_t = false)] stop_at_err: bool,
 }
 
 pub fn main() {
@@ -25,14 +30,28 @@ pub fn main() {
     let mut g = dictgen::generator::Generator::new(Options {
         populate_search_fields: args.search,
         always_include_ipa: args.ipa,
-        pretty_json: !args.minify
+        pretty_json: !args.minify,
+        colour: stderr().is_terminal(),
+        keep_parsing: !args.stop_at_err
     });
 
-    let text = read_to_string(args.file).unwrap();
-    g.parse(&text).unwrap();
+    let text = read_to_string(&args.file).unwrap();
+    if let Err(e) = g.parse(&text, &args.file) {
+        eprint!("{}", e);
+        exit(1);
+    }
+
 
     if let Some(conv) = args.convert {
-        let node = g.to_ipa(&conv).unwrap().unwrap();
+        let node = match g.to_ipa(&conv) {
+            Ok(node) => node,
+            Err(e) => {
+                eprint!("{}", e);
+                exit(1);
+            }
+        };
+
+        let node = node.unwrap();
         println!("{}", node.render_plain_text(true));
         return;
     }
